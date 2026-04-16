@@ -1,0 +1,9 @@
+path: C:/Users/shoai/thesis/YOLOv8/data
+train: train/images
+val: validation/images
+test: test/images
+
+names:
+  0: bird
+  1: drone
+
