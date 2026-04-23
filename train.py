@@ -8,7 +8,7 @@ if __name__ == "__main__":
 
     # 2. Train the model, https://docs.ultralytics.com/modes/train/#musgd-optimizer
     results = model.train(
-        data="C:/Users/shoai/thesis/YOLOv8/data.yaml",
+        data="C:/Users/shoai/project/thesis/data.yaml",
         epochs=50, # pass over the entire dataset, affect training duration and model performance
         imgsz=640, # input image size is 1024, but resized to 640 for training
         batch=16,
