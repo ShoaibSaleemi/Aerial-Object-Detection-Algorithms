@@ -1,4 +1,4 @@
-path: C:/Users/shoai/thesis/YOLOv8/data
+path: C:/Users/shoai/project/thesis/dataset
 train: train/images
 val: validation/images
 test: test/images

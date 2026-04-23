@@ -1,0 +1,9 @@
+# Ignore everything except Python files
+*
+!*.py
+!.gitignore
+!README.md
+!requirements.txt
+!data.yaml
+!.git/
+!*/

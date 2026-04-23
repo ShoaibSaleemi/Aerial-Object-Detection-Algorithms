@@ -29,13 +29,13 @@ def parse_args():
     parser.add_argument(
         "--images",
         type=str,
-        default="data/validation/images",
+        default="dataset/validation/images",
         help="Directory containing validation images.",
     )
     parser.add_argument(
         "--labels",
         type=str,
-        default="data/validation/labels",
+        default="dataset/validation/labels",
         help="Directory containing validation labels.",
     )
     parser.add_argument(
