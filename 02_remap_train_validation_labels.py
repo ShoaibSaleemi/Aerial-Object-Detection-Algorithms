@@ -2,6 +2,7 @@ import os
 import time
 
 label_dirs = [
+    "C:/Users/shoai/project/thesis/dataset/train/labels",
     "C:/Users/shoai/project/thesis/dataset/validation/labels",
 ]
 
