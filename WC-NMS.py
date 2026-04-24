@@ -1,4 +1,3 @@
-import argparse
 import random
 import time
 from pathlib import Path
@@ -17,82 +16,20 @@ random.seed(0)
 
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Evaluate YOLOv8 with class-aware EIoU Weighted-Cluster NMS on validation data."
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="runs/detect/train9/weights/best.pt",
-        help="Path to the trained YOLO model weights.",
-    )
-    parser.add_argument(
-        "--images",
-        type=str,
-        default="dataset/validation/images",
-        help="Directory containing validation images.",
-    )
-    parser.add_argument(
-        "--labels",
-        type=str,
-        default="dataset/validation/labels",
-        help="Directory containing validation labels.",
-    )
-    parser.add_argument(
-        "--iou-thresh",
-        type=float,
-        default=0.5,
-        help="IoU threshold for GT/pred matching in confusion matrix.",
-    )
-    parser.add_argument(
-        "--conf-thresh",
-        type=float,
-        default=0.70,
-        help="Confidence threshold for candidate detections before custom NMS.",
-    )
-    parser.add_argument(
-        "--nms-thresh",
-        type=float,
-        default=0.50,
-        help="EIoU threshold used inside Weighted-Cluster NMS.",
-    )
-    parser.add_argument(
-        "--imgsz",
-        type=int,
-        default=640,
-        help="Inference image size.",
-    )
-    parser.add_argument(
-        "--max-det",
-        type=int,
-        default=300,
-        help="Maximum raw detections kept before custom NMS.",
-    )
-    parser.add_argument(
-        "--save-plot",
-        type=str,
-        default="runs/detect/train9/confusion_matrix_eval.png",
-        help="Path to save confusion matrix visualization.",
-    )
-    parser.add_argument(
-        "--no-save-plot",
-        action="store_true",
-        help="Do not save the confusion matrix figure.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="",
-        help='Device to run on, e.g. "cpu", "0", "0,1". Empty = auto.',
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print per-image statistics during evaluation.",
-    )
-    return parser.parse_args()
+# Edit evaluation parameters here.
+MODEL_PATH = "runs/detect/train9/weights/best.pt"  # Path to model weights (.pt) used for evaluation.
+IMAGES_DIR = "dataset/validation/images"  # Directory containing validation images.
+LABELS_DIR = "dataset/validation/labels"  # Directory containing YOLO-format validation label files.
+IOU_THRESH = 0.5  # IoU threshold to match prediction with GT in confusion matrix counting.
+CONF_THRESH = 0.70  # Minimum class confidence before applying custom WC-NMS.
+NMS_THRESH = 0.50  # EIoU threshold inside Weighted-Cluster NMS (lower = more suppression).
+IMGSZ = 640  # Inference image size used by letterbox preprocessing.
+MAX_DET = 300  # Max raw detections retained before WC-NMS.
+SAVE_PLOT_PATH = "runs/detect/train9/confusion_matrix_eval.png"  # Output path for confusion matrix image.
+SAVE_METRICS_PLOT_PATH = "runs/detect/train9/metrics_table_eval.png"  # Output path for metrics table image.
+SAVE_PLOTS = True  # Save confusion-matrix and metrics-table figures when True.
+DEVICE = ""  # Device string: "cpu", "0", "0,1"; empty string uses default device.
+VERBOSE = False  # Print per-image matching stats when True.
 
 
 def resolve_image_path(images_dir: Path, stem: str):
@@ -117,7 +54,7 @@ def load_label_file(label_path: Path):
             cls = int(parts[0])
             x_center, y_center, w, h = map(float, parts[1:])
 
-            # Same mapping logic as your current validation.py
+            # Same mapping logic as validation.py
             if cls == 0:
                 category = 0  # bird
             elif cls == 1:
@@ -214,15 +151,193 @@ def plot_confusion(matrix, save_path):
     plt.close(fig)
 
 
+def safe_div(a, b):
+    return a / b if b != 0 else float("nan")
+
+
+def compute_metrics_from_confusion(matrix):
+    """
+    rows = predicted, cols = ground truth
+    """
+    n_classes = matrix.shape[0]
+    total = int(matrix.sum())
+
+    per_class_metrics = []
+
+    for c in range(n_classes):
+        tp = int(matrix[c, c])
+        fp = int(matrix[c, :].sum() - tp)
+        fn = int(matrix[:, c].sum() - tp)
+        tn = int(total - tp - fp - fn)
+
+        precision = safe_div(tp, tp + fp)
+        recall = safe_div(tp, tp + fn)
+        f1 = safe_div(2 * precision * recall, precision + recall) if not (
+            np.isnan(precision) or np.isnan(recall)
+        ) else float("nan")
+
+        # Thesis-style false alarm / false positive ratio from positive decisions
+        pfa = safe_div(fp, tp + fp)
+
+        # Detection probability = 1 - miss probability = TP / (TP + FN)
+        p_success = recall
+
+        per_class_metrics.append({
+            "class": CLASS_NAMES[c],
+            "TP": tp,
+            "FP": fp,
+            "FN": fn,
+            "TN": tn,
+            "Precision": precision,
+            "Recall": recall,
+            "F1-score": f1,
+            "False Positive Rate": pfa,
+            "Detection Probability": p_success,
+        })
+
+    macro_metrics = {
+        "Precision": np.nanmean([m["Precision"] for m in per_class_metrics]),
+        "Recall": np.nanmean([m["Recall"] for m in per_class_metrics]),
+        "F1-score": np.nanmean([m["F1-score"] for m in per_class_metrics]),
+        "False Positive Rate": np.nanmean([m["False Positive Rate"] for m in per_class_metrics]),
+        "Detection Probability": np.nanmean([m["Detection Probability"] for m in per_class_metrics]),
+    }
+
+    total_known = int(matrix[:, 0].sum() + matrix[:, 1].sum())
+    total_unknown = int(matrix[:, 2].sum())
+
+    known_misses = int(matrix[2, 0] + matrix[2, 1])
+    unknown_false_alarms = int(matrix[0, 2] + matrix[1, 2])
+    unknown_correct_rejections = int(matrix[2, 2])
+
+    summary_metrics = {
+        "Known objects": total_known,
+        "Unknown objects": total_unknown,
+        "Known miss rate": safe_div(known_misses, total_known),
+        "Unknown false alarm rate": safe_div(unknown_false_alarms, total_unknown),
+        "Unknown correct rejections": unknown_correct_rejections,
+    }
+
+    return per_class_metrics, macro_metrics, summary_metrics
+
+
+def print_metrics_table(per_class_metrics, macro_metrics, summary_metrics):
+    print("\nPer-class thesis metrics:")
+    header = (
+        f"{'Class':<10}"
+        f"{'TP':>8}{'FP':>8}{'FN':>8}{'TN':>8}"
+        f"{'Prec':>10}{'Recall':>10}{'F1':>10}{'Pfa':>10}{'P(success)':>14}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for m in per_class_metrics:
+        print(
+            f"{m['class']:<10}"
+            f"{m['TP']:>8}{m['FP']:>8}{m['FN']:>8}{m['TN']:>8}"
+            f"{m['Precision']:>10.4f}"
+            f"{m['Recall']:>10.4f}"
+            f"{m['F1-score']:>10.4f}"
+            f"{m['False Positive Rate']:>10.4f}"
+            f"{m['Detection Probability']:>14.4f}"
+        )
+
+    print("\nMacro-average thesis metrics:")
+    print(f"Precision:             {macro_metrics['Precision']:.4f}")
+    print(f"Recall:                {macro_metrics['Recall']:.4f}")
+    print(f"F1-score:              {macro_metrics['F1-score']:.4f}")
+    print(f"False Positive Rate:   {macro_metrics['False Positive Rate']:.4f}")
+    print(f"Detection Probability: {macro_metrics['Detection Probability']:.4f}")
+
+    print("\nOpen-set summary metrics:")
+    print(f"Known objects: {summary_metrics['Known objects']}")
+    print(f"Unknown objects: {summary_metrics['Unknown objects']}")
+    print(f"Known miss rate: {summary_metrics['Known miss rate']:.4f}")
+    print(f"Unknown false alarm rate: {summary_metrics['Unknown false alarm rate']:.4f}")
+    print(f"Unknown correct rejections: {summary_metrics['Unknown correct rejections']}")
+
+
+def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_path):
+    rows = []
+    columns = [
+        "Class", "TP", "FP", "FN", "TN",
+        "Precision", "Recall", "F1-score", "Pfa", "P(success)"
+    ]
+
+    for m in per_class_metrics:
+        rows.append([
+            m["class"],
+            m["TP"],
+            m["FP"],
+            m["FN"],
+            m["TN"],
+            f"{m['Precision']:.4f}",
+            f"{m['Recall']:.4f}",
+            f"{m['F1-score']:.4f}",
+            f"{m['False Positive Rate']:.4f}",
+            f"{m['Detection Probability']:.4f}",
+        ])
+
+    rows.append([
+        "macro-avg",
+        "-",
+        "-",
+        "-",
+        "-",
+        f"{macro_metrics['Precision']:.4f}",
+        f"{macro_metrics['Recall']:.4f}",
+        f"{macro_metrics['F1-score']:.4f}",
+        f"{macro_metrics['False Positive Rate']:.4f}",
+        f"{macro_metrics['Detection Probability']:.4f}",
+    ])
+
+    rows.append([
+        "open-set",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        f"{summary_metrics['Unknown false alarm rate']:.4f}",
+        f"{1.0 - summary_metrics['Known miss rate']:.4f}" if not np.isnan(summary_metrics["Known miss rate"]) else "nan",
+    ])
+
+    fig_h = 2.6 + 0.5 * len(rows)
+    fig, ax = plt.subplots(figsize=(13, fig_h))
+    ax.axis("off")
+    ax.set_title("Evaluation Metrics Table", fontsize=14, pad=12)
+
+    table = ax.table(
+        cellText=rows,
+        colLabels=columns,
+        cellLoc="center",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.5)
+
+    footer_text = (
+        f"Known objects: {summary_metrics['Known objects']}    "
+        f"Unknown objects: {summary_metrics['Unknown objects']}    "
+        f"Known miss rate: {summary_metrics['Known miss rate']:.4f}    "
+        f"Unknown false alarm rate: {summary_metrics['Unknown false alarm rate']:.4f}    "
+        f"Unknown correct rejections: {summary_metrics['Unknown correct rejections']}"
+    )
+    fig.text(0.5, 0.03, footer_text, ha="center", fontsize=10)
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout(rect=[0.02, 0.08, 0.98, 0.98])
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def preprocess_image_for_yolo(image_path: Path, imgsz: int, device: torch.device):
-    """
-    Returns:
-        im_tensor: (1, 3, H, W) float tensor in [0,1]
-        orig_bgr: original image as numpy array in BGR-like shape is not required
-        orig_shape: (h, w)
-    """
     img = Image.open(image_path).convert("RGB")
-    img_np = np.array(img)  # RGB, HWC
+    img_np = np.array(img)
     orig_shape = img_np.shape[:2]
 
     letterbox = LetterBox(new_shape=(imgsz, imgsz), auto=False, scale_fill=False, scaleup=True, stride=32)
@@ -237,11 +352,6 @@ def preprocess_image_for_yolo(image_path: Path, imgsz: int, device: torch.device
 
 
 def unwrap_raw_predictions(raw_output):
-    """
-    Tries to extract the main detection tensor from Ultralytics forward output.
-    Expected common shape after extraction:
-        (bs, no, num_preds) or (bs, num_preds, no)
-    """
     if isinstance(raw_output, torch.Tensor):
         pred = raw_output
     elif isinstance(raw_output, (list, tuple)):
@@ -266,20 +376,13 @@ def unwrap_raw_predictions(raw_output):
 
 
 def decode_raw_yolov8_predictions(raw_pred, num_classes):
-    """
-    Converts raw prediction tensor to shape (num_preds, 4 + num_classes)
-    with boxes in xywh format.
-
-    For YOLOv8 detect models, a common inference shape is (1, 4+nc, N).
-    """
     if raw_pred.ndim != 3 or raw_pred.shape[0] != 1:
         raise RuntimeError(f"Unexpected raw prediction shape: {tuple(raw_pred.shape)}")
 
-    # Try to standardize to (N, 4 + nc)
     if raw_pred.shape[1] == 4 + num_classes:
-        pred = raw_pred[0].transpose(0, 1)  # (no, N) -> (N, no)
+        pred = raw_pred[0].transpose(0, 1)
     elif raw_pred.shape[2] == 4 + num_classes:
-        pred = raw_pred[0]  # (N, no)
+        pred = raw_pred[0]
     else:
         raise RuntimeError(
             f"Could not interpret raw prediction shape {tuple(raw_pred.shape)} for nc={num_classes}"
@@ -289,10 +392,6 @@ def decode_raw_yolov8_predictions(raw_pred, num_classes):
 
 
 def box_iou_matrix_xyxy(boxes):
-    """
-    boxes: (N, 4) xyxy
-    returns IoU matrix (N, N)
-    """
     x1 = torch.max(boxes[:, None, 0], boxes[None, :, 0])
     y1 = torch.max(boxes[:, None, 1], boxes[None, :, 1])
     x2 = torch.min(boxes[:, None, 2], boxes[None, :, 2])
@@ -306,12 +405,6 @@ def box_iou_matrix_xyxy(boxes):
 
 
 def eiou_matrix_xyxy(boxes):
-    """
-    EIoU matrix based on the uploaded paper:
-        X = MIoU - REIoU
-    where REIoU uses center distance, width difference, height difference,
-    normalized by enclosing box dimensions. Values can be < 0.
-    """
     iou = box_iou_matrix_xyxy(boxes)
 
     widths = (boxes[:, 2] - boxes[:, 0]).clamp(min=1e-9)
@@ -344,25 +437,15 @@ def eiou_matrix_xyxy(boxes):
 
 
 def weighted_cluster_nms_eiou_single_class(boxes, scores, thresh):
-    """
-    Class-aware EIoU Weighted-Cluster NMS for one class.
-
-    boxes: (N, 4) xyxy
-    scores: (N,)
-    returns:
-        kept_boxes, kept_scores, kept_indices_in_sorted_order
-    """
     if boxes.numel() == 0:
         return boxes, scores, torch.empty((0,), dtype=torch.long, device=boxes.device)
 
-    """ Sort by scores descending """
     order = torch.argsort(scores, descending=True)
     boxes = boxes[order]
     scores = scores[order]
 
-    """ Build the upper-triangular EIoU matrix """
     x = eiou_matrix_xyxy(boxes)
-    x = torch.triu(x, diagonal=1)  # upper triangular only
+    x = torch.triu(x, diagonal=1)
 
     n = boxes.shape[0]
     b_prev = torch.ones(n, device=boxes.device, dtype=torch.float32)
@@ -391,13 +474,10 @@ def weighted_cluster_nms_eiou_single_class(boxes, scores, thresh):
             torch.empty((0,), dtype=torch.long, device=boxes.device),
         )
 
-    # Weighted coordinates:
-    # The paper's formula uses C' * B / Repmat4(sum_i C'(i,:)).
-    # To make weighted merging usable for kept leaders too, we include self-links with identity.
     c_prime = c_final + torch.eye(n, device=boxes.device, dtype=c_final.dtype)
-    c_prime = c_prime * scores.unsqueeze(1)  # multiply each row i by score_i
+    c_prime = c_prime * scores.unsqueeze(1)
 
-    weights = c_prime[:, keep_mask].transpose(0, 1)  # (#kept, N)
+    weights = c_prime[:, keep_mask].transpose(0, 1)
     denom = weights.sum(dim=1, keepdim=True).clamp(min=1e-9)
     merged_boxes = weights @ boxes / denom
 
@@ -407,15 +487,8 @@ def weighted_cluster_nms_eiou_single_class(boxes, scores, thresh):
     return merged_boxes, kept_scores, kept_indices
 
 
-def run_custom_inference(model, image_path: Path, args, device):
-    """
-    Runs raw forward pass, decodes predictions, applies class-aware EIoU Weighted-Cluster NMS.
-    Returns:
-        pred_boxes: list of [x1,y1,x2,y2] in original image coordinates
-        pred_labels: list of int labels in {0,1}
-        pred_scores: list of float scores
-    """
-    im, orig_shape = preprocess_image_for_yolo(image_path, args.imgsz, device)
+def run_custom_inference(model, image_path: Path, device, imgsz, conf_thresh, max_det, nms_thresh):
+    im, orig_shape = preprocess_image_for_yolo(image_path, imgsz, device)
 
     with torch.no_grad():
         raw_output = model.model(im)
@@ -423,8 +496,6 @@ def run_custom_inference(model, image_path: Path, args, device):
     raw_pred = unwrap_raw_predictions(raw_output)
     pred = decode_raw_yolov8_predictions(raw_pred, num_classes=len(model.names))
 
-    # YOLOv8 detect head commonly outputs [x, y, w, h, class_scores...]
-    # Unlike older YOLO variants, there is typically no separate objectness channel here.
     box_xywh = pred[:, :4]
     cls_scores = pred[:, 4:]
 
@@ -435,8 +506,7 @@ def run_custom_inference(model, image_path: Path, args, device):
 
     confs, clses = cls_scores.max(dim=1)
 
-    # Keep only bird/drone predictions; unknown is GT-only, same as your validation.py logic.
-    valid_mask = (clses < 2) & (confs >= args.conf_thresh)
+    valid_mask = (clses < 2) & (confs >= conf_thresh)
     box_xywh = box_xywh[valid_mask]
     confs = confs[valid_mask]
     clses = clses[valid_mask]
@@ -444,12 +514,10 @@ def run_custom_inference(model, image_path: Path, args, device):
     if box_xywh.numel() == 0:
         return [], [], []
 
-    # Convert xywh -> xyxy in resized/letterboxed image coordinates
     box_xyxy = ops.xywh2xyxy(box_xywh)
 
-    # Limit raw candidates before custom NMS
-    if box_xyxy.shape[0] > args.max_det:
-        topk = torch.argsort(confs, descending=True)[: args.max_det]
+    if box_xyxy.shape[0] > max_det:
+        topk = torch.argsort(confs, descending=True)[:max_det]
         box_xyxy = box_xyxy[topk]
         confs = confs[topk]
         clses = clses[topk]
@@ -458,7 +526,6 @@ def run_custom_inference(model, image_path: Path, args, device):
     final_scores = []
     final_labels = []
 
-    # Class-aware custom NMS: process bird and drone separately
     for class_id in [0, 1]:
         mask = clses == class_id
         if mask.sum() == 0:
@@ -468,13 +535,12 @@ def run_custom_inference(model, image_path: Path, args, device):
         cls_scores = confs[mask]
 
         kept_boxes, kept_scores, _ = weighted_cluster_nms_eiou_single_class(
-            cls_boxes, cls_scores, args.nms_thresh
+            cls_boxes, cls_scores, nms_thresh
         )
 
         if kept_boxes.numel() == 0:
             continue
 
-        # Scale boxes back to original image size
         kept_boxes = ops.scale_boxes(
             img1_shape=im.shape[2:],
             boxes=kept_boxes.clone(),
@@ -486,7 +552,6 @@ def run_custom_inference(model, image_path: Path, args, device):
             final_scores.append(float(s.item()))
             final_labels.append(int(class_id))
 
-    # Sort final outputs by score descending
     if len(final_scores) > 0:
         order = np.argsort(-np.array(final_scores))
         final_boxes = [final_boxes[i] for i in order]
@@ -496,14 +561,14 @@ def run_custom_inference(model, image_path: Path, args, device):
     return final_boxes, final_labels, final_scores
 
 
-def build_confusion_matrix(all_predictions, label_paths, args):
+def build_confusion_matrix(all_predictions, label_paths, images_dir, iou_thresh, verbose):
     matrix = np.zeros((3, 3), dtype=int)
     total_known = 0
     total_unknown = 0
 
     for image_idx, label_path in enumerate(sorted(label_paths)):
         image_name = label_path.stem
-        image_path = resolve_image_path(Path(args.images), image_name)
+        image_path = resolve_image_path(Path(images_dir), image_name)
         if image_path is None:
             continue
 
@@ -515,8 +580,8 @@ def build_confusion_matrix(all_predictions, label_paths, args):
         gt_boxes = [xywhn_to_xyxy(box, width, height) for box in gt_boxes_xywh]
 
         pred_boxes, pred_labels, _ = all_predictions[image_idx]
-        assignments, used_pred = match_predictions(
-            gt_boxes, gt_labels, pred_boxes, pred_labels, args.iou_thresh
+        assignments, _ = match_predictions(
+            gt_boxes, gt_labels, pred_boxes, pred_labels, iou_thresh
         )
 
         for gt_idx, gt_label in enumerate(gt_labels):
@@ -532,18 +597,14 @@ def build_confusion_matrix(all_predictions, label_paths, args):
             else:
                 matrix[2, gt_label] += 1
 
-        if args.verbose and len(gt_labels) > 0:
-            print(
-                f"{image_name}: GT {len(gt_labels)}, pred {len(pred_boxes)}, matched {len(assignments)}"
-            )
+        if verbose and len(gt_labels) > 0:
+            print(f"{image_name}: GT {len(gt_labels)}, pred {len(pred_boxes)}, matched {len(assignments)}")
 
     return matrix, total_known, total_unknown
 
 
 def main():
-    args = parse_args()
-
-    label_dir = Path(args.labels)
+    label_dir = Path(LABELS_DIR)
     if not label_dir.exists():
         raise FileNotFoundError(f"Label directory not found: {label_dir}")
 
@@ -551,12 +612,11 @@ def main():
     if len(label_paths) == 0:
         raise ValueError(f"No label files found in {label_dir}")
 
-    model = YOLO(args.model)
+    model = YOLO(MODEL_PATH)
     model.model.eval()
 
-    # Device selection
-    if args.device:
-        model.to(args.device)
+    if DEVICE:
+        model.to(DEVICE)
         device = next(model.model.parameters()).device
     else:
         device = next(model.model.parameters()).device
@@ -564,13 +624,13 @@ def main():
     valid_label_paths = []
     image_paths = []
     for label_path in label_paths:
-        image_path = resolve_image_path(Path(args.images), label_path.stem)
+        image_path = resolve_image_path(Path(IMAGES_DIR), label_path.stem)
         if image_path is not None:
             valid_label_paths.append(label_path)
             image_paths.append(image_path)
 
     if len(image_paths) == 0:
-        raise ValueError(f"No validation images found in {args.images}")
+        raise ValueError(f"No validation images found in {IMAGES_DIR}")
 
     print(f"Running raw inference + EIoU Weighted-Cluster NMS on {len(image_paths)} validation images...")
 
@@ -583,8 +643,11 @@ def main():
         pred_boxes, pred_labels, pred_scores = run_custom_inference(
             model=model,
             image_path=img_path,
-            args=args,
             device=device,
+            imgsz=IMGSZ,
+            conf_thresh=CONF_THRESH,
+            max_det=MAX_DET,
+            nms_thresh=NMS_THRESH,
         )
         all_predictions.append((pred_boxes, pred_labels, pred_scores))
 
@@ -598,7 +661,13 @@ def main():
         )
     print()
 
-    matrix, total_known, total_unknown = build_confusion_matrix(all_predictions, valid_label_paths, args)
+    matrix, total_known, total_unknown = build_confusion_matrix(
+        all_predictions,
+        valid_label_paths,
+        IMAGES_DIR,
+        IOU_THRESH,
+        VERBOSE,
+    )
 
     print("\nConfusion matrix (rows: predicted, cols: GT):")
     print("\t" + "\t".join(CLASS_NAMES))
@@ -618,9 +687,20 @@ def main():
     print(f"Unknown false alarm rate: {false_alarm_rate:.4f} ({unknown_false_alarms}/{total_unknown})")
     print(f"Unknown correct rejections: {unknown_correct_rejections}")
 
-    if not args.no_save_plot:
-        plot_confusion(matrix, args.save_plot)
-        print(f"Saved confusion matrix plot to {args.save_plot}")
+    per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
+    print_metrics_table(per_class_metrics, macro_metrics, summary_metrics)
+
+    if SAVE_PLOTS:
+        plot_confusion(matrix, SAVE_PLOT_PATH)
+        print(f"Saved confusion matrix plot to {SAVE_PLOT_PATH}")
+
+        plot_metrics_table(
+            per_class_metrics=per_class_metrics,
+            macro_metrics=macro_metrics,
+            summary_metrics=summary_metrics,
+            save_path=SAVE_METRICS_PLOT_PATH,
+        )
+        print(f"Saved metrics table plot to {SAVE_METRICS_PLOT_PATH}")
 
 
 if __name__ == "__main__":
