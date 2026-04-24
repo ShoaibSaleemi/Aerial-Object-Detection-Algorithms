@@ -16,7 +16,7 @@ for file in label_files:
     with open(path, 'r') as f:
         lines = f.readlines()
 
-    # Check if any line has class 0 or 3
+    # Check if any line has class 0 (helicopter) or 3 (plane)
     has_unwanted = any(int(line.strip().split()[0]) in [0, 3] for line in lines if line.strip())
 
     if has_unwanted:
