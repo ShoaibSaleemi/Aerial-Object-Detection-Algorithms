@@ -1,7 +1,9 @@
 from pathlib import Path
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
+import questionary
 import time
 from PIL import Image
 from ultralytics import YOLO
@@ -15,18 +17,14 @@ random.seed(0)
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
 # Edit evaluation parameters here.
-MODEL_PATH = "runs/detect/train9/weights/best.pt"
 IMAGES_DIR = "dataset/validation/images"
 LABELS_DIR = "dataset/validation/labels"
 IOU_THRESH = 0.5
 CONF_THRESH = 0.70
 IMGSZ = 640
-SAVE_PLOT_PATH = "runs/detect/train9/confusion_matrix_eval.png"
-SAVE_METRICS_PLOT_PATH = "runs/detect/train9/metrics_table_eval.png"
+
 SAVE_PLOT = True
 VERBOSE = False  # Print per-image matching/debug details during evaluation when True.
-ORANGE = "\033[38;5;208m"
-RESET = "\033[0m"
 
 
 def load_label_file(label_path: Path):
@@ -393,6 +391,32 @@ def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_p
 
 
 def main():
+    detect_root_dir = Path("runs/detect")
+    available_runs = sorted([path.name for path in detect_root_dir.iterdir() if path.is_dir()])
+
+    if len(available_runs) == 0:
+        raise ValueError(f"No folders found in {detect_root_dir}")
+
+    if len(sys.argv) > 1:
+        run_name = sys.argv[1]
+        if run_name not in available_runs:
+            available_text = ", ".join(available_runs)
+            raise ValueError(
+                f"Unknown folder '{run_name}'. Choose one from runs/detect: {available_text}"
+            )
+    else:
+        run_name = questionary.select(
+            "Choose a folder from runs/detect:",
+            choices=available_runs,
+        ).ask()
+        if not run_name:
+            raise ValueError("No folder selected from runs/detect")
+
+    detect_run_dir = detect_root_dir / run_name
+    model_path = str(detect_run_dir / "weights" / "best.pt")
+    save_plot_path = str(detect_run_dir / "confusion_matrix_eval.png")
+    save_metrics_plot_path = str(detect_run_dir / "metrics_table_eval.png")
+
     label_dir = Path(LABELS_DIR)
     if not label_dir.exists():
         raise FileNotFoundError(f"Label directory not found: {label_dir}")
@@ -401,7 +425,7 @@ def main():
     if len(label_paths) == 0:
         raise ValueError(f"No label files found in {label_dir}")
 
-    model = YOLO(MODEL_PATH)
+    model = YOLO(model_path)
     image_paths = []
     valid_label_paths = []
     for label_path in sorted(label_paths):
@@ -420,7 +444,7 @@ def main():
     if len(image_paths) == 0:
         raise ValueError(f"No validation images found in {IMAGES_DIR}")
 
-    print(f"{ORANGE}Running inference on {len(image_paths)} validation images...{RESET}")
+    print(f"Running inference on {len(image_paths)} validation images...")
     # Inference with progress bar
     total_files = len(image_paths)
     processed = 0
@@ -457,16 +481,16 @@ def main():
     print()
 
     if SAVE_PLOT:
-        plot_confusion(matrix, SAVE_PLOT_PATH)
-        print(f"Saved confusion matrix plot to {SAVE_PLOT_PATH}")
+        plot_confusion(matrix, save_plot_path)
+        print(f"Saved confusion matrix plot to {save_plot_path}")
 
         plot_metrics_table(
             per_class_metrics=per_class_metrics,
             macro_metrics=macro_metrics,
             summary_metrics=summary_metrics,
-            save_path=SAVE_METRICS_PLOT_PATH,
+            save_path=save_metrics_plot_path,
         )
-        print(f"Saved metrics table plot to {SAVE_METRICS_PLOT_PATH}")
+        print(f"Saved metrics table plot to {save_metrics_plot_path}")
 
 
 if __name__ == "__main__":
