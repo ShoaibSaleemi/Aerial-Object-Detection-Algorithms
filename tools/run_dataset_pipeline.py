@@ -1,9 +1,12 @@
 import subprocess
 import sys
+from pathlib import Path
+
+TOOLS_DIR = Path(__file__).resolve().parent
 
 scripts = [
     ("01_filter_train_ood.py", "Filtering OOD samples from train dataset"),
-    ("02_remap_validation_labels.py", "Remapping validation label IDs for evaluation"),
+    ("02_remap_train_validation_labels.py", "Remapping validation label IDs for evaluation"),
     ("03_check_validation_labels.py", "Checking class IDs in validation labels"),
 ]
 
@@ -14,7 +17,7 @@ def main():
     for i, (script, description) in enumerate(scripts, 1):
         print(f"Part {i}/{total_parts}: {description}")
         try:
-            subprocess.run([sys.executable, script], check=True)
+            subprocess.run([sys.executable, str(TOOLS_DIR / script)], check=True, cwd=str(TOOLS_DIR))
         except subprocess.CalledProcessError as e:
             print(f"Error running {script}: {e}")
             sys.exit(1)

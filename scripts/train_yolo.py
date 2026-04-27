@@ -1,4 +1,7 @@
 from ultralytics import YOLO
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if __name__ == "__main__":
     # 1. Load a model
@@ -8,7 +11,7 @@ if __name__ == "__main__":
 
     # 2. Train the model, https://docs.ultralytics.com/modes/train/#musgd-optimizer
     results = model.train(
-        data="C:/Users/shoai/project/thesis/data.yaml",
+        data=str(PROJECT_ROOT / "data.yaml"),
         epochs=50, # pass over the entire dataset, affect training duration and model performance
         imgsz=640, # input image size is 1024, but resized to 640 for training
         batch=16,

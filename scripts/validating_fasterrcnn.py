@@ -1,43 +1,51 @@
 from pathlib import Path
-import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
-import questionary
 import time
 from PIL import Image
-from ultralytics import YOLO
 import random
-import torch    
+import torch
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 torch.manual_seed(0)
 np.random.seed(0)
 random.seed(0)
 
+# This script is intended for open-set evaluation of a Faster R-CNN checkpoint
+# trained on known classes. Validation labels may include `unknown`, and any
+# prediction outside the known label set is folded into `unknown` for metrics.
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
-# Edit evaluation parameters here.
-IMAGES_DIR = "dataset/validation/images"
-LABELS_DIR = "dataset/validation/labels"
-IOU_THRESH = 0.5
-CONF_THRESH = 0.70
-IMGSZ = 640
+# Edit these parameters directly before running this script.
+CONFIG = {
+    "model": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "fasterrcnn_epoch_50.pt"),
+    "images": str(PROJECT_ROOT / "dataset" / "validation" / "images"),
+    "labels": str(PROJECT_ROOT / "dataset" / "validation" / "labels"),
+    "iou_thresh": 0.5,
+    "conf_thresh": 0.5,
+    "save_plot": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "confusion_matrix_val.png"),
+    "save_metrics_plot": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "metrics_table_val.png"),
+    "save_plot_enabled": True,
+    "verbose": False,
+    "device": "auto",  # "cpu", "cuda", or "auto"
+}
 
-SAVE_PLOT = True
-VERBOSE = False  # Print per-image matching/debug details during evaluation when True.
 
-
-def format_run_display_name(run_name: str) -> str:
-    """Convert run folder names like yolo8n to display names like YOLOv8n."""
-    lower_name = run_name.lower()
-    if lower_name.startswith("yolo") and len(run_name) > 4:
-        suffix = run_name[4:]
-        if suffix and suffix[0].isdigit():
-            return f"YOLOv{suffix}"
-    return run_name
+def format_model_display_name(model_path: Path) -> str:
+    """Return a clean model family name for figure titles."""
+    stem = model_path.stem.lower()
+    if stem.startswith("fasterrcnn"):
+        return "Faster R-CNN"
+    return model_path.stem.replace("_", " ")
 
 
 def load_label_file(label_path: Path):
+    """Load YOLO format labels and convert to pixel coordinates."""
     boxes = []
     categories = []
     if not label_path.exists():
@@ -62,16 +70,8 @@ def load_label_file(label_path: Path):
     return boxes, categories
 
 
-def yolo_xywh_to_xyxy(box):
-    x_center, y_center, w, h = box
-    x1 = x_center - w / 2.0
-    y1 = y_center - h / 2.0
-    x2 = x_center + w / 2.0
-    y2 = y_center + h / 2.0
-    return [x1, y1, x2, y2]
-
-
 def xywhn_to_xyxy(box, img_width, img_height):
+    """Convert normalized YOLO xywh to pixel xyxy."""
     x_center, y_center, w, h = box
     x1 = (x_center - w / 2.0) * img_width
     y1 = (y_center - h / 2.0) * img_height
@@ -81,6 +81,7 @@ def xywhn_to_xyxy(box, img_width, img_height):
 
 
 def compute_iou(box_a, box_b):
+    """Compute IoU between two boxes in xyxy format."""
     x1 = max(box_a[0], box_b[0])
     y1 = max(box_a[1], box_b[1])
     x2 = min(box_a[2], box_b[2])
@@ -99,6 +100,7 @@ def compute_iou(box_a, box_b):
 
 
 def match_predictions(gt_boxes, gt_labels, pred_boxes, pred_labels, iou_thresh):
+    """Match ground truth and predictions using greedy IoU matching."""
     n_gt = len(gt_boxes)
     n_pred = len(pred_boxes)
     if n_gt == 0:
@@ -130,42 +132,93 @@ def match_predictions(gt_boxes, gt_labels, pred_boxes, pred_labels, iou_thresh):
     return assignments, used_pred
 
 
-def build_confusion_matrix(results, label_paths, images_dir, iou_thresh, verbose):
+def build_model(checkpoint_path: Path, device="cpu"):
+    """Load Faster R-CNN model from checkpoint."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Infer num_classes from checkpoint
+    cls_score_weight = checkpoint["model_state_dict"]["roi_heads.box_predictor.cls_score.weight"]
+    num_classes = cls_score_weight.shape[0]
+    
+    model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    model.to(device)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    return model
+
+
+def run_inference(model, image_path: Path, conf_thresh: float, device="cpu"):
+    """Run Faster R-CNN inference on a single image."""
+    image = Image.open(image_path).convert("RGB")
+    image_tensor = (
+        torch.from_numpy(np.array(image, dtype="uint8"))
+        .permute(2, 0, 1)
+        .float()
+        .div(255.0)
+        .to(device)
+    )
+
+    with torch.no_grad():
+        predictions = model([image_tensor])
+
+    pred = predictions[0]
+    boxes = pred["boxes"].cpu().numpy()
+    labels = pred["labels"].cpu().numpy()
+    scores = pred["scores"].cpu().numpy()
+
+    filtered_boxes = []
+    filtered_labels = []
+    for box, label, score in zip(boxes, labels, scores):
+        if score >= conf_thresh:
+            filtered_boxes.append(box)
+            # Shift from torchvision (0=background) back to YOLO format (0=bird, 1=drone)
+            shifted_label = label - 1
+            if shifted_label in (0, 1):
+                filtered_labels.append(shifted_label)
+            else:
+                filtered_labels.append(2)
+
+    return filtered_boxes, filtered_labels
+
+
+def build_confusion_matrix(
+    model, image_paths, label_paths, conf_thresh, iou_thresh, verbose, device
+):
+    """Build confusion matrix from inference results."""
     matrix = np.zeros((3, 3), dtype=int)
     total_known = 0
     total_unknown = 0
-    total_images = len(label_paths)
+    total_files = len(image_paths)
+    start_time = time.time()
 
-    for image_idx, label_path in enumerate(sorted(label_paths)):
+    for image_idx, (image_path, label_path) in enumerate(zip(image_paths, label_paths)):
         image_name = label_path.stem
-        image_path = (Path(images_dir) / f"{image_name}.jpg")
-        if not image_path.exists():
-            image_path = None
-            for ext in [".png", ".jpeg", ".bmp", ".tif", ".tiff"]:
-                candidate = Path(images_dir) / f"{image_name}{ext}"
-                if candidate.exists():
-                    image_path = candidate
-                    break
-        if image_path is None:
-            continue
 
         gt_boxes_xywh, gt_labels = load_label_file(label_path)
         if len(gt_labels) == 0 and verbose:
             print(f"Skipping {image_name} because it has no labels.")
+        
+        # Print progress
+        elapsed = time.time() - start_time
+        minutes, seconds = divmod(int(elapsed), 60)
+        print(
+            f"Progress: {image_idx + 1}/{total_files} ({(image_idx + 1) / total_files * 100:.2f}%) "
+            f"Elapsed: {minutes}:{seconds:02d}",
+            end="\r",
+        )
 
         with Image.open(image_path) as img:
             width, height = img.size
         gt_boxes = [xywhn_to_xyxy(box, width, height) for box in gt_boxes_xywh]
 
-        result = results[image_idx]
-        pred_boxes = []
-        pred_labels = []
-        if hasattr(result, "boxes") and len(result.boxes) > 0:
-            for box, cls in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy()):
-                pred_labels.append(int(cls) if int(cls) in (0, 1) else 2)
-                pred_boxes.append(list(box))
+        pred_boxes, pred_labels = run_inference(model, image_path, conf_thresh, device)
 
-        assignments, used_pred = match_predictions(gt_boxes, gt_labels, pred_boxes, pred_labels, iou_thresh)
+        assignments, used_pred = match_predictions(
+            gt_boxes, gt_labels, pred_boxes, pred_labels, iou_thresh
+        )
 
         for gt_idx, gt_label in enumerate(gt_labels):
             if gt_label in (0, 1):
@@ -185,10 +238,12 @@ def build_confusion_matrix(results, label_paths, images_dir, iou_thresh, verbose
                 f"{image_name}: GT {len(gt_labels)}, pred {len(pred_boxes)}, matched {len(assignments)}"
             )
 
+    print()  # Newline after progress bar
     return matrix, total_known, total_unknown
 
 
 def plot_confusion(matrix, save_path, title_prefix):
+    """Plot and save confusion matrix."""
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(matrix, cmap="Blues")
 
@@ -241,10 +296,7 @@ def compute_metrics_from_confusion(matrix):
             np.isnan(precision) or np.isnan(recall)
         ) else float("nan")
 
-        # Thesis-style false alarm / false positive ratio from positive decisions
         pfa = safe_div(fp, tp + fp)
-
-        # Detection probability = 1 - miss probability = TP / (TP + FN)
         p_success = recall
 
         per_class_metrics.append({
@@ -401,34 +453,27 @@ def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_p
 
 
 def main():
-    detect_root_dir = Path("runs/detect")
-    available_runs = sorted([path.name for path in detect_root_dir.iterdir() if path.is_dir()])
+    model_path = CONFIG["model"]
+    images_dir = CONFIG["images"]
+    labels_dir = CONFIG["labels"]
+    iou_thresh = CONFIG["iou_thresh"]
+    conf_thresh = CONFIG["conf_thresh"]
+    save_plot = CONFIG["save_plot"]
+    save_metrics_plot = CONFIG["save_metrics_plot"]
+    save_plot_enabled = CONFIG["save_plot_enabled"]
+    verbose = CONFIG["verbose"]
+    device = CONFIG["device"]
 
-    if len(available_runs) == 0:
-        raise ValueError(f"No folders found in {detect_root_dir}")
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
 
-    if len(sys.argv) > 1:
-        run_name = sys.argv[1]
-        if run_name not in available_runs:
-            available_text = ", ".join(available_runs)
-            raise ValueError(
-                f"Unknown folder '{run_name}'. Choose one from runs/detect: {available_text}"
-            )
-    else:
-        run_name = questionary.select(
-            "Choose a folder from runs/detect:",
-            choices=available_runs,
-        ).ask()
-        if not run_name:
-            raise ValueError("No folder selected from runs/detect")
+    checkpoint_path = Path(model_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    model_display_name = format_model_display_name(checkpoint_path)
 
-    detect_run_dir = detect_root_dir / run_name
-    run_display_name = format_run_display_name(run_name)
-    model_path = str(detect_run_dir / "weights" / "best.pt")
-    save_plot_path = str(detect_run_dir / "confusion_matrix_eval.png")
-    save_metrics_plot_path = str(detect_run_dir / "metrics_table_eval.png")
-
-    label_dir = Path(LABELS_DIR)
+    label_dir = Path(labels_dir)
     if not label_dir.exists():
         raise FileNotFoundError(f"Label directory not found: {label_dir}")
 
@@ -436,52 +481,39 @@ def main():
     if len(label_paths) == 0:
         raise ValueError(f"No label files found in {label_dir}")
 
-    model = YOLO(model_path)
     image_paths = []
     valid_label_paths = []
     for label_path in sorted(label_paths):
         image_name = label_path.stem
-        image_path = Path(IMAGES_DIR) / f"{image_name}.jpg"
+        image_path = Path(images_dir) / f"{image_name}.jpg"
         if not image_path.exists():
             for ext in [".png", ".jpeg", ".bmp", ".tif", ".tiff"]:
-                candidate = Path(IMAGES_DIR) / f"{image_name}{ext}"
+                candidate = Path(images_dir) / f"{image_name}{ext}"
                 if candidate.exists():
                     image_path = candidate
                     break
         if image_path.exists():
-            image_paths.append(str(image_path))
+            image_paths.append(image_path)
             valid_label_paths.append(label_path)
 
     if len(image_paths) == 0:
-        raise ValueError(f"No validation images found in {IMAGES_DIR}")
+        raise ValueError(f"No validation images found in {images_dir}")
+
+    print(f"Loading model from {checkpoint_path}...")
+    model = build_model(checkpoint_path, device=device)
 
     print(f"Running inference on {len(image_paths)} validation images...")
-    # Inference with progress bar
-    total_files = len(image_paths)
-    processed = 0
-    start_time = time.time()
-    results = []
-    for img_path in image_paths:
-        result = model.predict(
-            source=img_path,
-            conf=CONF_THRESH,
-            imgsz=IMGSZ,
-            verbose=False,
-        )
-        results.append(result[0] if isinstance(result, list) else result)
-        processed += 1
-        elapsed = time.time() - start_time
-        minutes, seconds = divmod(int(elapsed), 60)
-        print(f"Progress: {processed}/{total_files} ({processed / total_files * 100:.2f}%) Elapsed: {minutes}:{seconds:02d}", end='\r')
-    print()  # Newline after progress bar
 
-    matrix, total_known, total_unknown = build_confusion_matrix(
-        results,
+    matrix, _, _ = build_confusion_matrix(
+        model,
+        image_paths,
         valid_label_paths,
-        IMAGES_DIR,
-        IOU_THRESH,
-        VERBOSE,
+        conf_thresh,
+        iou_thresh,
+        verbose,
+        device,
     )
+
     print("\nConfusion matrix (rows: predicted, cols: GT):")
     print("\t" + "\t".join(CLASS_NAMES))
     for i, row in enumerate(matrix):
@@ -491,20 +523,19 @@ def main():
     print_metrics_table(per_class_metrics, macro_metrics, summary_metrics)
     print()
 
-    if SAVE_PLOT:
-        plot_confusion(matrix, save_plot_path, run_display_name)
-        print(f"Saved confusion matrix plot to {save_plot_path}")
+    if save_plot_enabled:
+        plot_confusion(matrix, save_plot, model_display_name)
+        print(f"Saved confusion matrix plot to {save_plot}")
 
         plot_metrics_table(
             per_class_metrics=per_class_metrics,
             macro_metrics=macro_metrics,
             summary_metrics=summary_metrics,
-            save_path=save_metrics_plot_path,
-            title_prefix=run_display_name,
+            save_path=save_metrics_plot,
+            title_prefix=model_display_name,
         )
-        print(f"Saved metrics table plot to {save_metrics_plot_path}")
+        print(f"Saved metrics table plot to {save_metrics_plot}")
 
 
 if __name__ == "__main__":
     main()
-

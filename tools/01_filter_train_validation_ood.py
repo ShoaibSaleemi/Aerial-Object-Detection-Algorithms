@@ -1,10 +1,15 @@
 import os
 import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+# Remove helicopter and plane samples so train/validation stay closed-set
+# for bird and drone detection.
 dataset_splits = [
-    ("dataset/train/labels", "dataset/train/images"),
-    ("dataset/validation/labels", "dataset/validation/images"),
+    (str(PROJECT_ROOT / "dataset" / "train" / "labels"), str(PROJECT_ROOT / "dataset" / "train" / "images")),
+    (str(PROJECT_ROOT / "dataset" / "validation" / "labels"), str(PROJECT_ROOT / "dataset" / "validation" / "images")),
 ]
 
 # Count label files across all configured splits for a single progress bar.

@@ -1,9 +1,12 @@
 import os
 import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 label_dirs = [
-    "C:/Users/shoai/project/thesis/dataset/train/labels",
-    "C:/Users/shoai/project/thesis/dataset/validation/labels",
+    str(PROJECT_ROOT / "dataset" / "train" / "labels"),
+    str(PROJECT_ROOT / "dataset" / "validation" / "labels"),
 ]
 
 # Count only .txt files for progress tracking

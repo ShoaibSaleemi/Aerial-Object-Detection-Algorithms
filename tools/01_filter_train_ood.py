@@ -1,8 +1,10 @@
 import os
 import time
+from pathlib import Path
 
-label_dir = "dataset/train/labels"
-image_dir = "dataset/train/images"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+label_dir = str(PROJECT_ROOT / "dataset" / "train" / "labels")
+image_dir = str(PROJECT_ROOT / "dataset" / "train" / "images")
 
 # Get list of label files
 label_files = [f for f in os.listdir(label_dir) if f.endswith('.txt')]
