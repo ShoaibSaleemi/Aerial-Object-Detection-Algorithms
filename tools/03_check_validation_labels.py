@@ -1,7 +1,9 @@
 import os
 import time
+from pathlib import Path
 
-label_dir = "C:/Users/shoai/project/thesis/dataset/validation/labels"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+label_dir = str(PROJECT_ROOT / "dataset" / "validation" / "labels")
 
 classes = set()
 

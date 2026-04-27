@@ -10,6 +10,8 @@ from ultralytics import YOLO
 from ultralytics.data.augment import LetterBox
 from ultralytics.utils import ops
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 torch.manual_seed(0)
 np.random.seed(0)
 random.seed(0)
@@ -17,16 +19,16 @@ random.seed(0)
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
 # Edit evaluation parameters here.
-MODEL_PATH = "runs/detect/train9/weights/best.pt"  # Path to model weights (.pt) used for evaluation.
-IMAGES_DIR = "dataset/validation/images"  # Directory containing validation images.
-LABELS_DIR = "dataset/validation/labels"  # Directory containing YOLO-format validation label files.
+MODEL_PATH = PROJECT_ROOT / "runs" / "detect" / "train9" / "weights" / "best.pt"  # Path to model weights (.pt) used for evaluation.
+IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"  # Directory containing validation images.
+LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"  # Directory containing YOLO-format validation label files.
 IOU_THRESH = 0.5  # IoU threshold to match prediction with GT in confusion matrix counting.
 CONF_THRESH = 0.70  # Minimum class confidence before applying custom WC-NMS.
 NMS_THRESH = 0.50  # EIoU threshold inside Weighted-Cluster NMS (lower = more suppression).
 IMGSZ = 640  # Inference image size used by letterbox preprocessing.
 MAX_DET = 300  # Max raw detections retained before WC-NMS.
-SAVE_PLOT_PATH = "runs/detect/train9/confusion_matrix_eval.png"  # Output path for confusion matrix image.
-SAVE_METRICS_PLOT_PATH = "runs/detect/train9/metrics_table_eval.png"  # Output path for metrics table image.
+SAVE_PLOT_PATH = PROJECT_ROOT / "runs" / "detect" / "train9" / "confusion_matrix_eval.png"  # Output path for confusion matrix image.
+SAVE_METRICS_PLOT_PATH = PROJECT_ROOT / "runs" / "detect" / "train9" / "metrics_table_eval.png"  # Output path for metrics table image.
 SAVE_PLOTS = True  # Save confusion-matrix and metrics-table figures when True.
 DEVICE = ""  # Device string: "cpu", "0", "0,1"; empty string uses default device.
 VERBOSE = False  # Print per-image matching stats when True.
@@ -612,7 +614,7 @@ def main():
     if len(label_paths) == 0:
         raise ValueError(f"No label files found in {label_dir}")
 
-    model = YOLO(MODEL_PATH)
+    model = YOLO(str(MODEL_PATH))
     model.model.eval()
 
     if DEVICE:

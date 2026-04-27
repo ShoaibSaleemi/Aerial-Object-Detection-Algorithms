@@ -1,5 +1,5 @@
-import argparse
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -11,10 +11,30 @@ from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
-from label_conversion_fasterrcnn import load_fasterrcnn_label_file
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.convert_labels_fasterrcnn import load_fasterrcnn_label_file
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+# Edit these parameters directly before running this script.
+CONFIG = {
+    "data": str(PROJECT_ROOT / "data.yaml"),
+    "epochs": 50,
+    "batch": 4,
+    "lr": 0.005,
+    "momentum": 0.9,
+    "weight_decay": 0.0005,
+    "workers": 2,
+    "save_period": 10,
+    "output": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train"),
+    "labels_dir_name": "labels",
+    "no_resume": False,
+    "no_pretrained": False,
+}
 
 
 def parse_data_yaml(data_yaml_path: Path) -> Tuple[Path, Path, Dict[int, str]]:
@@ -219,7 +239,7 @@ def compute_ap(recall: np.ndarray, precision: np.ndarray) -> float:
 
     mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))
     x = np.linspace(0, 1, 101)
-    return float(np.trapz(np.interp(x, mrec, mpre), x))
+    return float(np.trapezoid(np.interp(x, mrec, mpre), x))
 
 
 def evaluate_detection_metrics(model, data_loader, device, num_classes):
@@ -340,37 +360,11 @@ def evaluate_detection_metrics(model, data_loader, device, num_classes):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Train torchvision Faster R-CNN directly from YOLO txt labels"
-    )
-    parser.add_argument("--data", type=str, default="data.yaml", help="Path to data.yaml")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=0.005)
-    parser.add_argument("--momentum", type=float, default=0.9)
-    parser.add_argument("--weight-decay", type=float, default=0.0005)
-    parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--save-period", type=int, default=10)
-    parser.add_argument("--output", type=str, default="runs/fasterrcnn/train")
-    parser.add_argument(
-        "--labels-dir-name",
-        type=str,
-        default="labels_fasterrcnn",
-        help="Label folder name under each split (e.g., labels_fasterrcnn)",
-    )
-    parser.add_argument(
-        "--no-resume",
-        action="store_true",
-        help="Disable auto-resume from output/last.pt if it exists",
-    )
-    parser.add_argument("--no-pretrained", action="store_true")
-    args = parser.parse_args()
-
-    data_yaml_path = Path(args.data).resolve()
+    data_yaml_path = Path(CONFIG["data"]).resolve()
     train_images, val_images, names = parse_data_yaml(data_yaml_path)
 
-    train_labels_dir = train_images.parent / args.labels_dir_name
-    val_labels_dir = val_images.parent / args.labels_dir_name
+    train_labels_dir = train_images.parent / CONFIG["labels_dir_name"]
+    val_labels_dir = val_images.parent / CONFIG["labels_dir_name"]
 
     train_ds = FasterRCNNTxtDetectionDataset(train_images, train_labels_dir)
 
@@ -379,11 +373,12 @@ def main():
     max_class_seen = max(train_max_class, val_max_class)
 
     num_named_classes = len(names)
-    num_dataset_classes = max_class_seen + 1 if max_class_seen >= 0 else 0
+    # labels_fasterrcnn uses 1-based IDs, so max_class_seen IS num_foreground_classes
+    num_dataset_classes = max_class_seen if max_class_seen >= 0 else 0
     num_foreground_classes = max(num_named_classes, num_dataset_classes)
     num_classes = num_foreground_classes + 1
 
-    if max_class_seen >= num_named_classes:
+    if max_class_seen > num_named_classes:
         print(
             "Warning: dataset contains class ids not present in data.yaml names. "
             f"Max class id seen: {max_class_seen}, names count: {num_named_classes}. "
@@ -400,9 +395,9 @@ def main():
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=args.batch,
+        batch_size=CONFIG["batch"],
         shuffle=True,
-        num_workers=args.workers,
+        num_workers=CONFIG["workers"],
         collate_fn=collate_fn,
     )
 
@@ -411,29 +406,29 @@ def main():
         val_ds,
         batch_size=1,
         shuffle=False,
-        num_workers=args.workers,
+        num_workers=CONFIG["workers"],
         collate_fn=collate_fn,
     )
 
-    model = build_model(num_classes=num_classes, use_pretrained=not args.no_pretrained)
+    model = build_model(num_classes=num_classes, use_pretrained=not CONFIG["no_pretrained"])
     model.to(device)
 
     optimizer = torch.optim.SGD(
         [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-        momentum=args.momentum,
-        weight_decay=args.weight_decay,
+        lr=CONFIG["lr"],
+        momentum=CONFIG["momentum"],
+        weight_decay=CONFIG["weight_decay"],
     )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
-    output_dir = Path(args.output)
+    output_dir = Path(CONFIG["output"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
     start_epoch = 1
     best_fitness = -1.0
     last_ckpt_path = output_dir / "last.pt"
 
-    if last_ckpt_path.exists() and not args.no_resume:
+    if last_ckpt_path.exists() and not CONFIG["no_resume"]:
         print(f"Resuming from checkpoint: {last_ckpt_path}")
         checkpoint = torch.load(last_ckpt_path, map_location=device)
 
@@ -452,14 +447,14 @@ def main():
             f"best fitness: {best_fitness:.4f}"
         )
 
-        if start_epoch > args.epochs:
+        if start_epoch > CONFIG["epochs"]:
             print(
                 f"Checkpoint is already at epoch {start_epoch - 1}, "
-                f"which is >= requested epochs ({args.epochs}). Nothing to do."
+                f"which is >= requested epochs ({CONFIG['epochs']}). Nothing to do."
             )
             return
 
-    for epoch in range(start_epoch, args.epochs + 1):
+    for epoch in range(start_epoch, CONFIG["epochs"] + 1):
         avg_loss = train_one_epoch(model, optimizer, train_loader, device, epoch)
         scheduler.step()
 
@@ -494,7 +489,7 @@ def main():
 
         torch.save(checkpoint, last_ckpt_path)
 
-        if epoch % args.save_period == 0 or epoch == args.epochs:
+        if epoch % CONFIG["save_period"] == 0 or epoch == CONFIG["epochs"]:
             ckpt_path = output_dir / f"fasterrcnn_epoch_{epoch}.pt"
             torch.save(checkpoint, ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")

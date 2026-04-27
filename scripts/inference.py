@@ -3,11 +3,13 @@ from ultralytics import YOLO
 import cv2
 import time
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
-MODEL_PATH = "runs/detect/train9/weights/best.pt"
-IMAGE_DIR = "dataset/validation/images"
-OUTPUT_DIR = "runs/detect/train9/inference_results"
+MODEL_PATH = PROJECT_ROOT / "runs" / "detect" / "train9" / "weights" / "best.pt"
+IMAGE_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
+OUTPUT_DIR = PROJECT_ROOT / "runs" / "detect" / "train9" / "inference_results"
 CONF_THRESH = 0.70
 IMG_SIZE = 640
 
@@ -17,14 +19,14 @@ COLORS = {
     "unknown": (0, 165, 255), # orange
 }
 
-model = YOLO(MODEL_PATH)
+model = YOLO(str(MODEL_PATH))
 
 image_paths = sorted(
-    p for p in Path(IMAGE_DIR).iterdir()
+    p for p in IMAGE_DIR.iterdir()
     if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 )
 
-Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 print(f"Loaded model: {MODEL_PATH}")
 print(f"Found {len(image_paths)} images in {IMAGE_DIR}")
@@ -64,7 +66,7 @@ for img_path in image_paths:
         cv2.rectangle(img, (x1, y1 - th - 6), (x1 + tw, y1), color, -1)
         cv2.putText(img, text, (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-    save_path = Path(OUTPUT_DIR) / img_path.name
+    save_path = OUTPUT_DIR / img_path.name
     cv2.imwrite(str(save_path), img)
 
     # Update progress
