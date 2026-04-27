@@ -5,7 +5,7 @@ from pathlib import Path
 TOOLS_DIR = Path(__file__).resolve().parent
 
 scripts = [
-    ("filter_train_ood.py", "Filtering OOD samples from train dataset"),
+    ("filter_train_validation_ood.py", "Filtering OOD samples from train dataset"),
     ("remap_train_validation_labels.py", "Remapping validation label IDs for evaluation"),
     ("check_validation_labels.py", "Checking class IDs in validation labels"),
 ]
