@@ -2,12 +2,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-TOOLS_DIR = Path(__file__).resolve().parent
+TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
 
 scripts = [
-    ("01_filter_train_ood.py", "Filtering OOD samples from train dataset"),
-    ("02_remap_train_validation_labels.py", "Remapping validation label IDs for evaluation"),
-    ("03_check_validation_labels.py", "Checking class IDs in validation labels"),
+    ("filter_train_validation_ood.py", "Filtering OOD samples from train dataset"),
+    ("convert_labels_fasterrcnn.py", "Converting labels for Faster R-CNN format"),
+    ("remap_train_validation_labels.py", "Remapping validation label IDs for evaluation"),
+    ("check_validation_labels.py", "Checking class IDs in validation labels"),
 ]
 
 
