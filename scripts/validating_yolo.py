@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+from itertools import zip_longest
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -279,32 +280,58 @@ def compute_metrics_from_confusion(matrix):
     return per_class_metrics, macro_metrics, summary_metrics
 
 
-def print_metrics_table(per_class_metrics, macro_metrics, summary_metrics):
-    print("\nPer-class metrics:")
+def build_confusion_table_lines(matrix):
+    lines = ["Confusion matrix (rows: predicted, cols: GT):"]
+    row_label_w = 10
+    col_w = 8
+    for i, row in enumerate(matrix):
+        lines.append(
+            f"{CLASS_NAMES[i]:<{row_label_w}}"
+            + "".join(f"{int(x):>{col_w}}" for x in row)
+        )
+    lines.append(" " * row_label_w + "".join(f"{name:>{col_w}}" for name in CLASS_NAMES))
+    return lines
+
+
+def build_metrics_table_lines(per_class_metrics, macro_metrics):
+    lines = ["Per-class metrics:"]
     header = (
         f"{'Class':<10}"
         f"{'Prec':>10}{'Recall':>10}{'F1':>10}"
     )
-    print(header)
-    print("-" * len(header))
+    lines.append(header)
+    lines.append("-" * len(header))
 
     for m in per_class_metrics:
-        print(
+        lines.append(
             f"{m['class']:<10}"
             f"{fmt_pct(m['Precision']):>10}"
             f"{fmt_pct(m['Recall']):>10}"
             f"{fmt_pct(m['F1-score']):>10}"
         )
 
-    print("-" * len(header))
-    _ORANGE = "\033[38;5;214m"
-    _RESET = "\033[0m"
-    print(_ORANGE + (
+    lines.append("-" * len(header))
+    orange = "\033[38;5;214m"
+    reset = "\033[0m"
+    lines.append(
         f"{'macro-avg':<10}"
-        f"{fmt_pct(macro_metrics['Precision']):>10}"
-        f"{fmt_pct(macro_metrics['Recall']):>10}"
-        f"{fmt_pct(macro_metrics['F1-score']):>10}"
-    ) + _RESET)
+        + orange
+        + f"{fmt_pct(macro_metrics['Precision']):>10}"
+        + f"{fmt_pct(macro_metrics['Recall']):>10}"
+        + f"{fmt_pct(macro_metrics['F1-score']):>10}"
+        + reset
+    )
+    return lines
+
+
+def print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics):
+    left_lines = build_confusion_table_lines(matrix)
+    right_lines = build_metrics_table_lines(per_class_metrics, macro_metrics)
+
+    left_width = max(len(line) for line in left_lines)
+    gap = 4
+    for left, right in zip_longest(left_lines, right_lines, fillvalue=""):
+        print(f"{left:<{left_width}}{' ' * gap}{right}")
 
 
 def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_path, title_prefix):
@@ -437,13 +464,8 @@ def main():
         IOU_THRESH,
         VERBOSE,
     )
-    print("\nConfusion matrix (rows: predicted, cols: GT):")
-    print("\t" + "\t".join(CLASS_NAMES))
-    for i, row in enumerate(matrix):
-        print(f"{CLASS_NAMES[i]}\t" + "\t".join(str(x) for x in row))
-
     per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
-    print_metrics_table(per_class_metrics, macro_metrics, summary_metrics)
+    print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics)
     print()
 
     if SAVE_PLOT:
