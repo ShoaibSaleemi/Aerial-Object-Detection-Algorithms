@@ -14,7 +14,7 @@ torch.manual_seed(0)
 np.random.seed(0)
 random.seed(0)
 
-# Closed-set known classes + open-set unknown bucket.
+# Closed-set known classes + open-set unknown.
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
 # Edit evaluation parameters here.
