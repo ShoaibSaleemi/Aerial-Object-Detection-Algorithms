@@ -187,6 +187,12 @@ def build_confusion_matrix(results, label_paths, images_dir, iou_thresh, verbose
                 f"{image_name}: GT {len(gt_labels)}, pred {len(pred_boxes)}, matched {len(assignments)}"
             )
 
+        print(
+            f"Matrix progress: {image_idx + 1}/{total_images} ({(image_idx + 1) / total_images * 100:.2f}%)",
+            end="\r",
+        )
+
+    print()
     return matrix, total_known, total_unknown
 
 
@@ -243,12 +249,6 @@ def compute_metrics_from_confusion(matrix):
             np.isnan(precision) or np.isnan(recall)
         ) else float("nan")
 
-        # Thesis-style false alarm / false positive ratio from positive decisions
-        pfa = safe_div(fp, tp + fp)
-
-        # Detection probability = 1 - miss probability = TP / (TP + FN)
-        p_success = recall
-
         per_class_metrics.append({
             "class": CLASS_NAMES[c],
             "TP": tp,
@@ -258,30 +258,21 @@ def compute_metrics_from_confusion(matrix):
             "Precision": precision,
             "Recall": recall,
             "F1-score": f1,
-            "False Positive Rate": pfa,
-            "Detection Probability": p_success,
         })
 
     macro_metrics = {
         "Precision": np.nanmean([m["Precision"] for m in per_class_metrics]),
         "Recall": np.nanmean([m["Recall"] for m in per_class_metrics]),
         "F1-score": np.nanmean([m["F1-score"] for m in per_class_metrics]),
-        "False Positive Rate": np.nanmean([m["False Positive Rate"] for m in per_class_metrics]),
-        "Detection Probability": np.nanmean([m["Detection Probability"] for m in per_class_metrics]),
     }
 
     total_known = int(matrix[:, 0].sum() + matrix[:, 1].sum())
     total_unknown = int(matrix[:, 2].sum())
-
-    known_misses = int(matrix[2, 0] + matrix[2, 1])
-    unknown_false_alarms = int(matrix[0, 2] + matrix[1, 2])
     unknown_correct_rejections = int(matrix[2, 2])
 
     summary_metrics = {
         "Known objects": total_known,
         "Unknown objects": total_unknown,
-        "Known miss rate": safe_div(known_misses, total_known),
-        "Unknown false alarm rate": safe_div(unknown_false_alarms, total_unknown),
         "Unknown correct rejections": unknown_correct_rejections,
     }
 
@@ -292,8 +283,7 @@ def print_metrics_table(per_class_metrics, macro_metrics, summary_metrics):
     print("\nPer-class metrics:")
     header = (
         f"{'Class':<10}"
-        f"{'TP':>8}{'FP':>8}{'FN':>8}{'TN':>8}"
-        f"{'Prec':>10}{'Recall':>10}{'F1':>10}{'Pfa':>10}{'P(success)':>14}"
+        f"{'Prec':>10}{'Recall':>10}{'F1':>10}"
     )
     print(header)
     print("-" * len(header))
@@ -301,74 +291,39 @@ def print_metrics_table(per_class_metrics, macro_metrics, summary_metrics):
     for m in per_class_metrics:
         print(
             f"{m['class']:<10}"
-            f"{m['TP']:>8}{m['FP']:>8}{m['FN']:>8}{m['TN']:>8}"
             f"{fmt_pct(m['Precision']):>10}"
             f"{fmt_pct(m['Recall']):>10}"
             f"{fmt_pct(m['F1-score']):>10}"
-            f"{fmt_pct(m['False Positive Rate']):>10}"
-            f"{fmt_pct(m['Detection Probability']):>14}"
         )
 
-    print("\nMacro-average metrics:")
-    print(f"Precision:             {fmt_pct(macro_metrics['Precision'])}")
-    print(f"Recall:                {fmt_pct(macro_metrics['Recall'])}")
-    print(f"F1-score:              {fmt_pct(macro_metrics['F1-score'])}")
-    print(f"False Positive Rate:   {fmt_pct(macro_metrics['False Positive Rate'])}")
-    print(f"Detection Probability: {fmt_pct(macro_metrics['Detection Probability'])}")
-
-    print("\nOpen-set summary metrics:")
-    print(f"Known objects: {summary_metrics['Known objects']}")
-    print(f"Unknown objects: {summary_metrics['Unknown objects']}")
-    print(f"Known miss rate: {fmt_pct(summary_metrics['Known miss rate'])}")
-    print(f"Unknown false alarm rate: {fmt_pct(summary_metrics['Unknown false alarm rate'])}")
-    print(f"Unknown correct rejections: {summary_metrics['Unknown correct rejections']}")
+    print("-" * len(header))
+    _ORANGE = "\033[38;5;214m"
+    _RESET = "\033[0m"
+    print(_ORANGE + (
+        f"{'macro-avg':<10}"
+        f"{fmt_pct(macro_metrics['Precision']):>10}"
+        f"{fmt_pct(macro_metrics['Recall']):>10}"
+        f"{fmt_pct(macro_metrics['F1-score']):>10}"
+    ) + _RESET)
 
 
 def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_path, title_prefix):
     rows = []
-    columns = [
-        "Class", "TP", "FP", "FN", "TN",
-        "Precision", "Recall", "F1-score", "Pfa", "P(success)"
-    ]
+    columns = ["Class", "Precision", "Recall", "F1-score"]
 
     for m in per_class_metrics:
         rows.append([
             m["class"],
-            m["TP"],
-            m["FP"],
-            m["FN"],
-            m["TN"],
             fmt_pct(m["Precision"]),
             fmt_pct(m["Recall"]),
             fmt_pct(m["F1-score"]),
-            fmt_pct(m["False Positive Rate"]),
-            fmt_pct(m["Detection Probability"]),
         ])
 
     rows.append([
         "macro-avg",
-        "-",
-        "-",
-        "-",
-        "-",
         fmt_pct(macro_metrics["Precision"]),
         fmt_pct(macro_metrics["Recall"]),
         fmt_pct(macro_metrics["F1-score"]),
-        fmt_pct(macro_metrics["False Positive Rate"]),
-        fmt_pct(macro_metrics["Detection Probability"]),
-    ])
-
-    rows.append([
-        "open-set",
-        "-",
-        "-",
-        "-",
-        "-",
-        "-",
-        "-",
-        "-",
-        fmt_pct(summary_metrics["Unknown false alarm rate"]),
-        fmt_pct(1.0 - summary_metrics["Known miss rate"]) if not np.isnan(summary_metrics["Known miss rate"]) else "nan",
     ])
 
     fig_h = 2.6 + 0.5 * len(rows)
@@ -389,8 +344,6 @@ def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_p
     footer_text = (
         f"Known objects: {summary_metrics['Known objects']}    "
         f"Unknown objects: {summary_metrics['Unknown objects']}    "
-        f"Known miss rate: {fmt_pct(summary_metrics['Known miss rate'])}    "
-        f"Unknown false alarm rate: {fmt_pct(summary_metrics['Unknown false alarm rate'])}    "
         f"Unknown correct rejections: {summary_metrics['Unknown correct rejections']}"
     )
     fig.text(0.5, 0.03, footer_text, ha="center", fontsize=10)
