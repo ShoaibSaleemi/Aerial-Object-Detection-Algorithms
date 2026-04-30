@@ -23,16 +23,16 @@ LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
 IOU_THRESH = 0.5
 # Pre-fusion threshold: keep candidate boxes relatively permissive so WBF can
 # leverage cross-model agreement instead of dropping candidates too early.
-CONF_THRESH = 0.25
+CONF_THRESH = 0.7
 FUSION_IOU_THRESH = 0.50
 IMGSZ = 640
 DEVICE = ""  # "cpu", "0", "0,1"; empty lets Ultralytics auto-select.
 
 # Unknown-decision thresholds (applied after known-class weighted voting).
-MIN_MODEL_SUPPORT = 2
-KNOWN_FUSED_CONF_THRESH = 0.35
-SCORE_MARGIN_THRESH = 0.08
-DISAGREEMENT_RATIO_THRESH = 0.85
+MIN_MODEL_SUPPORT = 3
+KNOWN_FUSED_CONF_THRESH = 0.55
+SCORE_MARGIN_THRESH = 0.20
+DISAGREEMENT_RATIO_THRESH = 0.55
 
 # Ensemble model list: (name, path_to_weights)
 MODELS = [
