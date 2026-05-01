@@ -10,7 +10,7 @@ from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 torch.manual_seed(0)
 np.random.seed(0)

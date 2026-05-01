@@ -1,16 +1,18 @@
 import csv
 from pathlib import Path
-import random
-import time
+import sys
 from itertools import zip_longest
 
 import matplotlib.pyplot as plt
 import numpy as np
+import questionary
+import time
 from PIL import Image
-import torch
 from ultralytics import YOLO
+import random
+import torch    
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 torch.manual_seed(0)
 np.random.seed(0)
@@ -23,67 +25,20 @@ IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
 LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
 IOU_THRESH = 0.5
 CONF_THRESH = 0.70
-FUSION_IOU_THRESH = 0.50
 IMGSZ = 640
-DEVICE = ""  # "cpu", "0", "0,1"; empty lets Ultralytics auto-select.
-
-# Unknown-decision thresholds (applied after known-class weighted voting).
-MIN_MODEL_SUPPORT = 3
-KNOWN_FUSED_CONF_THRESH = 0.55
-SCORE_MARGIN_THRESH = 0.20
-DISAGREEMENT_RATIO_THRESH = 0.55
-
-# Ensemble model list: (name, path_to_weights)
-MODELS = [
-    ("yolo8n", PROJECT_ROOT / "runs" / "detect" / "yolo8n" / "weights" / "best.pt"),
-    ("yolo9t", PROJECT_ROOT / "runs" / "detect" / "yolo9t" / "weights" / "best.pt"),
-    ("yolo10n", PROJECT_ROOT / "runs" / "detect" / "yolo10n" / "weights" / "best.pt"),
-]
-
-# Per-model per-class weighting for weighted voting / box fusion.
-MODEL_WEIGHTS = {
-    "yolo8n": {"bird": 1.000, "drone": 1.000, "unknown": 1.000},
-    "yolo9t": {"bird": 1.000, "drone": 1.000, "unknown": 1.000},
-    "yolo10n": {"bird": 1.000, "drone": 1.000, "unknown": 1.000},
-}
 
 SAVE_PLOT = True
-VERBOSE = False
-
-OUTPUT_DIR = PROJECT_ROOT / "runs" / "detect" / "weighted_voter"
-SAVE_PLOT_PATH = OUTPUT_DIR / "confusion_matrix_eval.png"
-SAVE_METRICS_CSV_PATH = OUTPUT_DIR / "metrics_table_eval.csv"
+VERBOSE = False  # Print per-image matching/debug details during evaluation when True.
 
 
-def class_name_from_id(cls_id: int) -> str:
-    if cls_id == 0:
-        return "bird"
-    if cls_id == 1:
-        return "drone"
-    return "unknown"
-
-
-def normalize_class_name(name: str) -> str:
-    lower = str(name).strip().lower()
-    if "bird" in lower:
-        return "bird"
-    if "drone" in lower:
-        return "drone"
-    return "unknown"
-
-
-def build_model_class_map(model):
-    names = getattr(model, "names", None)
-    if names is None:
-        return {}
-
-    if isinstance(names, dict):
-        return {int(k): normalize_class_name(v) for k, v in names.items()}
-
-    if isinstance(names, list):
-        return {i: normalize_class_name(v) for i, v in enumerate(names)}
-
-    return {}
+def format_run_display_name(run_name: str) -> str:
+    """Convert run folder names like yolo8n to display names like YOLOv8n."""
+    lower_name = run_name.lower()
+    if lower_name.startswith("yolo") and len(run_name) > 4:
+        suffix = run_name[4:]
+        if suffix and suffix[0].isdigit():
+            return f"YOLOv{suffix}"
+    return run_name
 
 
 def load_label_file(label_path: Path):
@@ -109,6 +64,15 @@ def load_label_file(label_path: Path):
             boxes.append((x_center, y_center, w, h))
 
     return boxes, categories
+
+
+def yolo_xywh_to_xyxy(box):
+    x_center, y_center, w, h = box
+    x1 = x_center - w / 2.0
+    y1 = y_center - h / 2.0
+    x2 = x_center + w / 2.0
+    y2 = y_center + h / 2.0
+    return [x1, y1, x2, y2]
 
 
 def xywhn_to_xyxy(box, img_width, img_height):
@@ -170,142 +134,7 @@ def match_predictions(gt_boxes, gt_labels, pred_boxes, pred_labels, iou_thresh):
     return assignments, used_pred
 
 
-def cluster_detections(detections, iou_thresh):
-    clusters = []
-    for det in sorted(detections, key=lambda d: d["confidence"], reverse=True):
-        matched = False
-        for cluster in clusters:
-            if compute_iou(det["box"], cluster["rep_box"]) >= iou_thresh:
-                cluster["items"].append(det)
-                boxes = np.array([item["box"] for item in cluster["items"]], dtype=np.float32)
-                cluster["rep_box"] = boxes.mean(axis=0).tolist()
-                matched = True
-                break
-        if not matched:
-            clusters.append({"items": [det], "rep_box": det["box"][:]})
-    return [c["items"] for c in clusters]
-
-
-def fuse_cluster(cluster_items):
-    class_scores = {0: 0.0, 1: 0.0}
-    for det in cluster_items:
-        if det["class_id"] in (0, 1):
-            class_scores[det["class_id"]] += det["weighted_score"]
-
-    best_known_class = max(class_scores.items(), key=lambda kv: kv[1])[0]
-    second_known_class = 1 - best_known_class
-    best_score = class_scores[best_known_class]
-    second_score = class_scores[second_known_class]
-    score_margin = best_score - second_score
-    disagreement_ratio = second_score / (best_score + 1e-12)
-
-    best_known_support_models = {
-        det["model"]
-        for det in cluster_items
-        if det["class_id"] == best_known_class
-    }
-    support_count = len(best_known_support_models)
-
-    best_known_items = [d for d in cluster_items if d["class_id"] == best_known_class]
-    best_known_fused_conf = (
-        float(np.mean([d["confidence"] for d in best_known_items]))
-        if best_known_items
-        else 0.0
-    )
-
-    uncertain = (
-        support_count < MIN_MODEL_SUPPORT
-        or best_known_fused_conf < KNOWN_FUSED_CONF_THRESH
-        or score_margin < SCORE_MARGIN_THRESH
-        or disagreement_ratio > DISAGREEMENT_RATIO_THRESH
-    )
-
-    if uncertain:
-        final_class = 2
-        chosen = list(cluster_items)
-    else:
-        final_class = best_known_class
-        chosen = best_known_items
-
-    if not chosen:
-        return None
-
-    fused_conf = float(np.mean([d["confidence"] for d in chosen]))
-
-    score_sum = sum(d["weighted_score"] for d in chosen)
-    if score_sum <= 0:
-        return None
-
-    x1 = sum(d["weighted_score"] * d["box"][0] for d in chosen) / score_sum
-    y1 = sum(d["weighted_score"] * d["box"][1] for d in chosen) / score_sum
-    x2 = sum(d["weighted_score"] * d["box"][2] for d in chosen) / score_sum
-    y2 = sum(d["weighted_score"] * d["box"][3] for d in chosen) / score_sum
-
-    return {
-        "box": [float(x1), float(y1), float(x2), float(y2)],
-        "class_id": int(final_class),
-        "confidence": fused_conf,
-    }
-
-
-def run_weighted_boxes_fusion_on_image(models, image_path: Path):
-    all_detections = []
-    per_model_predictions = {model_name: [] for model_name, _, _ in models}
-
-    for model_name, model, class_map in models:
-        results = model.predict(
-            source=str(image_path),
-            conf=CONF_THRESH,
-            imgsz=IMGSZ,
-            device=DEVICE,
-            verbose=False,
-        )
-        result = results[0] if isinstance(results, list) else results
-
-        if not hasattr(result, "boxes") or len(result.boxes) == 0:
-            continue
-
-        boxes_xyxy = result.boxes.xyxy.cpu().numpy()
-        class_ids = result.boxes.cls.cpu().numpy().astype(int)
-        confidences = result.boxes.conf.cpu().numpy().astype(float)
-
-        for box, cls_id, conf in zip(boxes_xyxy, class_ids, confidences):
-            cls_name = class_map.get(int(cls_id), class_name_from_id(int(cls_id)))
-            cls_idx = 0 if cls_name == "bird" else 1 if cls_name == "drone" else 2
-            model_weight = MODEL_WEIGHTS.get(model_name, {}).get(cls_name, 1.0)
-
-            per_model_predictions[model_name].append(
-                {
-                    "box": [float(v) for v in box.tolist()],
-                    "class_id": cls_idx,
-                    "confidence": float(conf),
-                }
-            )
-
-            all_detections.append(
-                {
-                    "box": [float(v) for v in box.tolist()],
-                    "class_id": cls_idx,
-                    "confidence": float(conf),
-                    "model": model_name,
-                    "weighted_score": float(model_weight * conf),
-                }
-            )
-
-    if not all_detections:
-        return [], per_model_predictions
-
-    clusters = cluster_detections(all_detections, FUSION_IOU_THRESH)
-    fused = []
-    for cluster in clusters:
-        item = fuse_cluster(cluster)
-        if item is not None:
-            fused.append(item)
-
-    return fused, per_model_predictions
-
-
-def build_confusion_matrix(fused_results, label_paths, images_dir, iou_thresh, verbose):
+def build_confusion_matrix(results, label_paths, images_dir, iou_thresh, verbose):
     matrix = np.zeros((3, 3), dtype=int)
     total_known = 0
     total_unknown = 0
@@ -313,7 +142,7 @@ def build_confusion_matrix(fused_results, label_paths, images_dir, iou_thresh, v
 
     for image_idx, label_path in enumerate(sorted(label_paths)):
         image_name = label_path.stem
-        image_path = Path(images_dir) / f"{image_name}.jpg"
+        image_path = (Path(images_dir) / f"{image_name}.jpg")
         if not image_path.exists():
             image_path = None
             for ext in [".png", ".jpeg", ".bmp", ".tif", ".tiff"]:
@@ -332,11 +161,15 @@ def build_confusion_matrix(fused_results, label_paths, images_dir, iou_thresh, v
             width, height = img.size
         gt_boxes = [xywhn_to_xyxy(box, width, height) for box in gt_boxes_xywh]
 
-        preds = fused_results[image_idx]
-        pred_boxes = [p["box"] for p in preds]
-        pred_labels = [p["class_id"] for p in preds]
+        result = results[image_idx]
+        pred_boxes = []
+        pred_labels = []
+        if hasattr(result, "boxes") and len(result.boxes) > 0:
+            for box, cls in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy()):
+                pred_labels.append(int(cls) if int(cls) in (0, 1) else 2)
+                pred_boxes.append(list(box))
 
-        assignments, _ = match_predictions(gt_boxes, gt_labels, pred_boxes, pred_labels, iou_thresh)
+        assignments, used_pred = match_predictions(gt_boxes, gt_labels, pred_boxes, pred_labels, iou_thresh)
 
         for gt_idx, gt_label in enumerate(gt_labels):
             if gt_label in (0, 1):
@@ -356,6 +189,12 @@ def build_confusion_matrix(fused_results, label_paths, images_dir, iou_thresh, v
                 f"{image_name}: GT {len(gt_labels)}, pred {len(pred_boxes)}, matched {len(assignments)}"
             )
 
+        print(
+            f"Matrix progress: {image_idx + 1}/{total_images} ({(image_idx + 1) / total_images * 100:.2f}%)",
+            end="\r",
+        )
+
+    print()
     return matrix, total_known, total_unknown
 
 
@@ -487,6 +326,7 @@ def print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_me
     for left, right in zip_longest(left_lines, right_lines, fillvalue=""):
         print(f"{left:<{left_width}}{' ' * gap}{right}")
 
+
 def save_metrics_table_csv(per_class_metrics, macro_metrics, save_path):
     rows = []
     for m in per_class_metrics:
@@ -513,32 +353,45 @@ def save_metrics_table_csv(per_class_metrics, macro_metrics, save_path):
 
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    detect_root_dir = PROJECT_ROOT / "runs" / "detect"
+    available_runs = sorted([path.name for path in detect_root_dir.iterdir() if path.is_dir()])
 
-    loaded_models = []
-    print("Loading ensemble models...")
-    for model_name, model_path in MODELS:
-        if not model_path.exists():
-            print(f"[SKIP] {model_name}: file not found at {model_path}")
-            continue
-        model = YOLO(str(model_path))
-        class_map = build_model_class_map(model)
-        loaded_models.append((model_name, model, class_map))
-        print(f"[OK]   {model_name}: {model_path.name}")
+    if len(available_runs) == 0:
+        raise ValueError(f"No folders found in {detect_root_dir}")
 
-    if len(loaded_models) == 0:
-        raise ValueError("No ensemble models were loaded. Check MODELS paths.")
+    if len(sys.argv) > 1:
+        run_name = sys.argv[1]
+        if run_name not in available_runs:
+            available_text = ", ".join(available_runs)
+            raise ValueError(
+                f"Unknown folder '{run_name}'. Choose one from runs/detect: {available_text}"
+            )
+    else:
+        run_name = questionary.select(
+            "Choose a folder from runs/detect:",
+            choices=available_runs,
+        ).ask()
+        if not run_name:
+            raise ValueError("No folder selected from runs/detect")
 
-    if not LABELS_DIR.exists():
-        raise FileNotFoundError(f"Label directory not found: {LABELS_DIR}")
+    detect_run_dir = detect_root_dir / run_name
+    run_display_name = format_run_display_name(run_name)
+    model_path = str(detect_run_dir / "weights" / "best.pt")
+    save_plot_path = str(detect_run_dir / "confusion_matrix_eval.png")
+    save_metrics_csv_path = str(detect_run_dir / "metrics_table_eval.csv")
 
-    label_paths = sorted(list(LABELS_DIR.glob("*.txt")))
+    label_dir = LABELS_DIR
+    if not label_dir.exists():
+        raise FileNotFoundError(f"Label directory not found: {label_dir}")
+
+    label_paths = list(label_dir.glob("*.txt"))
     if len(label_paths) == 0:
-        raise ValueError(f"No label files found in {LABELS_DIR}")
+        raise ValueError(f"No label files found in {label_dir}")
 
+    model = YOLO(model_path)
     image_paths = []
     valid_label_paths = []
-    for label_path in label_paths:
+    for label_path in sorted(label_paths):
         image_name = label_path.stem
         image_path = IMAGES_DIR / f"{image_name}.jpg"
         if not image_path.exists():
@@ -548,73 +401,55 @@ def main():
                     image_path = candidate
                     break
         if image_path.exists():
-            image_paths.append(image_path)
+            image_paths.append(str(image_path))
             valid_label_paths.append(label_path)
 
     if len(image_paths) == 0:
         raise ValueError(f"No validation images found in {IMAGES_DIR}")
 
-    print(f"Running weighted box fusion inference on {len(image_paths)} validation images...")
+    print(f"Running inference on {len(image_paths)} validation images...")
+    # Inference with progress bar
     total_files = len(image_paths)
+    processed = 0
     start_time = time.time()
-
-    fused_results_per_image = []
-    per_model_results = {model_name: [] for model_name, _, _ in loaded_models}
-    for idx, image_path in enumerate(image_paths, 1):
-        fused, per_model_preds = run_weighted_boxes_fusion_on_image(loaded_models, image_path)
-        fused_results_per_image.append(fused)
-        for model_name in per_model_results:
-            per_model_results[model_name].append(per_model_preds[model_name])
-
+    results = []
+    for img_path in image_paths:
+        result = model.predict(
+            source=img_path,
+            conf=CONF_THRESH,
+            imgsz=IMGSZ,
+            verbose=False,
+        )
+        results.append(result[0] if isinstance(result, list) else result)
+        processed += 1
         elapsed = time.time() - start_time
         minutes, seconds = divmod(int(elapsed), 60)
-        print(
-            f"Progress: {idx}/{total_files} ({idx / total_files * 100:.2f}%) \033[38;5;214mElapsed: {minutes}:{seconds:02d}\033[0m",
-            end="\r",
-        )
-    print()
-
-    # Print per-model metrics first.
-    for model_name, _, _ in loaded_models:
-        model_matrix, _, _ = build_confusion_matrix(
-            per_model_results[model_name],
-            valid_label_paths,
-            IMAGES_DIR,
-            IOU_THRESH,
-            VERBOSE,
-        )
-        print(f"\n{'=' * 70}")
-        print(f"Model: {model_name}")
-        print(f"{'=' * 70}")
-        pcm, mm, sm = compute_metrics_from_confusion(model_matrix)
-        print_confusion_and_metrics_side_by_side(model_matrix, pcm, mm)
+        print(f"Progress: {processed}/{total_files} ({processed / total_files * 100:.2f}%) Elapsed: {minutes}:{seconds:02d}", end='\r')
+    print()  # Newline after progress bar
 
     matrix, total_known, total_unknown = build_confusion_matrix(
-        fused_results_per_image,
+        results,
         valid_label_paths,
         IMAGES_DIR,
         IOU_THRESH,
         VERBOSE,
     )
-
-    print(f"\n{'=' * 70}")
-    print("Ensemble: Weighted Boxes Fusion")
-    print(f"{'=' * 70}")
     per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
     print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics)
     print()
 
     if SAVE_PLOT:
-        plot_confusion(matrix, SAVE_PLOT_PATH, "Weighted Boxes Fusion")
-        print(f"Saved confusion matrix plot to {SAVE_PLOT_PATH}")
+        plot_confusion(matrix, save_plot_path, run_display_name)
+        print(f"Saved confusion matrix plot to {save_plot_path}")
 
         save_metrics_table_csv(
             per_class_metrics=per_class_metrics,
             macro_metrics=macro_metrics,
-            save_path=SAVE_METRICS_CSV_PATH,
+            save_path=save_metrics_csv_path,
         )
-        print(f"Saved metrics table CSV to {SAVE_METRICS_CSV_PATH}")
+        print(f"Saved metrics table CSV to {save_metrics_csv_path}")
 
 
 if __name__ == "__main__":
     main()
+

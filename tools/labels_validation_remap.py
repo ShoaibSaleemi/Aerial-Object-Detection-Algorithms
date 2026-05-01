@@ -5,7 +5,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 label_dirs = [
-    str(PROJECT_ROOT / "dataset" / "train" / "labels"),
     str(PROJECT_ROOT / "dataset" / "validation" / "labels"),
 ]
 
