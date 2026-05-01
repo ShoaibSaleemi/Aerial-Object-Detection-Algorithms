@@ -1,11 +1,9 @@
 import random
-import sys
 import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import questionary
 import torch
 from PIL import Image
 from ultralytics import YOLO
@@ -609,32 +607,6 @@ def build_confusion_matrix(all_predictions, label_paths, images_dir, iou_thresh,
 
 
 def main():
-    detect_root_dir = PROJECT_ROOT / "runs" / "detect"
-    available_runs = sorted([path.name for path in detect_root_dir.iterdir() if path.is_dir()])
-
-    if len(available_runs) == 0:
-        raise ValueError(f"No folders found in {detect_root_dir}")
-
-    if len(sys.argv) > 1:
-        run_name = sys.argv[1]
-        if run_name not in available_runs:
-            available_text = ", ".join(available_runs)
-            raise ValueError(
-                f"Unknown folder '{run_name}'. Choose one from runs/detect: {available_text}"
-            )
-    else:
-        run_name = questionary.select(
-            "Choose a folder from runs/detect:",
-            choices=available_runs,
-        ).ask()
-        if not run_name:
-            raise ValueError("No folder selected from runs/detect")
-
-    detect_run_dir = detect_root_dir / run_name
-    model_path = detect_run_dir / "weights" / "best.pt"
-    save_plot_path = detect_run_dir / "confusion_matrix_eval.png"
-    save_metrics_plot_path = detect_run_dir / "metrics_table_eval.png"
-
     label_dir = Path(LABELS_DIR)
     if not label_dir.exists():
         raise FileNotFoundError(f"Label directory not found: {label_dir}")
@@ -643,7 +615,7 @@ def main():
     if len(label_paths) == 0:
         raise ValueError(f"No label files found in {label_dir}")
 
-    model = YOLO(str(model_path))
+    model = YOLO(str(MODEL_PATH))
     model.model.eval()
 
     if DEVICE:
@@ -722,16 +694,16 @@ def main():
     print_metrics_table(per_class_metrics, macro_metrics, summary_metrics)
 
     if SAVE_PLOTS:
-        plot_confusion(matrix, save_plot_path)
-        print(f"Saved confusion matrix plot to {save_plot_path}")
+        plot_confusion(matrix, SAVE_PLOT_PATH)
+        print(f"Saved confusion matrix plot to {SAVE_PLOT_PATH}")
 
         plot_metrics_table(
             per_class_metrics=per_class_metrics,
             macro_metrics=macro_metrics,
             summary_metrics=summary_metrics,
-            save_path=save_metrics_plot_path,
+            save_path=SAVE_METRICS_PLOT_PATH,
         )
-        print(f"Saved metrics table plot to {save_metrics_plot_path}")
+        print(f"Saved metrics table plot to {SAVE_METRICS_PLOT_PATH}")
 
 
 if __name__ == "__main__":
