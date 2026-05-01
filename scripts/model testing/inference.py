@@ -3,7 +3,7 @@ from ultralytics import YOLO
 import cv2
 import time
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 CLASS_NAMES = ["bird", "drone", "unknown"]
 

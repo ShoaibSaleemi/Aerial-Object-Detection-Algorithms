@@ -17,8 +17,14 @@ Visual output per track:
 
 from collections import defaultdict
 from pathlib import Path
+import csv
+import json
 import sys
 import time
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 import cv2
 import numpy as np
@@ -31,7 +37,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 CLASS_NAMES = ["bird", "drone", "unknown"]
 VIDEO_DIR   = PROJECT_ROOT / "dataset" / "test" / "videos"
-CONF_THRESH = 0.25           # per-model detection threshold before fusion
+CONF_THRESH = 0.7           # per-model detection threshold before fusion
 IMG_SIZE    = 640
 DEVICE      = ""             # "cpu", "0", etc.; empty = auto
 
@@ -294,20 +300,20 @@ def xywh_to_xyxy(box) -> list[float]:
 # ─────────────────────────────────────────────────────────────────────────────
 class MultiObjectTracker:
     def __init__(self, lstm_device: torch.device):
-        self.tracks: list[tuple[KalmanBoxTracker, int, object]] = []
+        self.tracks: list[tuple[KalmanBoxTracker, int, float, object]] = []
         self.lstm   = TrajectoryLSTM().to(lstm_device).eval()
         self.device = lstm_device
         self.trails: dict[int, list[tuple[int, int]]] = defaultdict(list)
 
     def update(
         self,
-        detections: list[tuple[list[float], int]],
+        detections: list[tuple[list[float], int, float]],
         frame_w: int,
         frame_h: int,
-    ) -> list[tuple[list[float], int, int, list[float] | None]]:
+    ) -> list[tuple[list[float], int, int, float, list[float] | None]]:
 
         # Kalman predict
-        preds_xyxy = [xywh_to_xyxy(trk.predict()) for trk, _, __ in self.tracks]
+        preds_xyxy = [xywh_to_xyxy(trk.predict()) for trk, _, _c, __ in self.tracks]
 
         # Greedy IoU matching
         n_t, n_d = len(preds_xyxy), len(detections)
@@ -318,7 +324,7 @@ class MultiObjectTracker:
         if n_t and n_d:
             cost = np.zeros((n_t, n_d), dtype=np.float32)
             for ti, pxy in enumerate(preds_xyxy):
-                for di, (dxy, _) in enumerate(detections):
+                for di, (dxy, _, _c) in enumerate(detections):
                     cost[ti, di] = _iou(pxy, dxy)
 
             for val, ti, di in sorted(
@@ -333,29 +339,29 @@ class MultiObjectTracker:
 
         # Update matched
         for ti, di in pairs:
-            dxy, dcls = detections[di]
+            dxy, dcls, dconf = detections[di]
             xywh = xyxy_to_xywh(dxy)
-            trk, _, hidden = self.tracks[ti]
+            trk, _, _c, hidden = self.tracks[ti]
             trk.update(xywh)
             hidden = self._lstm_step(xywh, frame_w, frame_h, hidden)
-            self.tracks[ti] = (trk, dcls, hidden)
+            self.tracks[ti] = (trk, dcls, dconf, hidden)
 
         # Increment lost for unmatched tracks
-        for ti, (trk, cls, hid) in enumerate(self.tracks):
+        for ti, (trk, cls, conf, hid) in enumerate(self.tracks):
             if ti not in matched_t:
                 trk.lost += 1
 
         # Spawn new tracks
-        for di, (dxy, dcls) in enumerate(detections):
+        for di, (dxy, dcls, dconf) in enumerate(detections):
             if di not in matched_d:
-                self.tracks.append((KalmanBoxTracker(xyxy_to_xywh(dxy)), dcls, None))
+                self.tracks.append((KalmanBoxTracker(xyxy_to_xywh(dxy)), dcls, dconf, None))
 
         # Prune dead tracks
-        self.tracks = [(t, c, h) for t, c, h in self.tracks if t.lost <= MAX_LOST]
+        self.tracks = [(t, c, cf, h) for t, c, cf, h in self.tracks if t.lost <= MAX_LOST]
 
         # Build output + update trails
-        results: list[tuple[list[float], int, int, list[float] | None]] = []
-        for trk, cls, hidden in self.tracks:
+        results: list[tuple[list[float], int, int, float, list[float] | None]] = []
+        for trk, cls, conf, hidden in self.tracks:
             if trk.hits < MIN_HITS and trk.lost > 0:
                 continue
             state    = trk.get_state()
@@ -368,9 +374,9 @@ class MultiObjectTracker:
                 del trail[:-TRAIL_LEN]
 
             lstm_pred = self._lstm_predict(trk.history, frame_w, frame_h)
-            results.append((box_xyxy, trk.id, cls, lstm_pred))
+            results.append((box_xyxy, trk.id, cls, conf, lstm_pred))
 
-        live_ids = {trk.id for trk, _, __ in self.tracks}
+        live_ids = {trk.id for trk, _, _c, __ in self.tracks}
         for tid in [k for k in self.trails if k not in live_ids]:
             del self.trails[tid]
 
@@ -402,14 +408,14 @@ class MultiObjectTracker:
 # Drawing
 # ─────────────────────────────────────────────────────────────────────────────
 def draw_tracks(frame: np.ndarray, track_results: list, trails: dict):
-    for box_xyxy, track_id, cls_int, lstm_pred in track_results:
+    for box_xyxy, track_id, cls_int, conf, lstm_pred in track_results:
         label = CLASS_NAMES[cls_int] if cls_int < len(CLASS_NAMES) else "unknown"
         color = COLORS[label]
 
         x1, y1, x2, y2 = (int(v) for v in box_xyxy)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        text = f"#{track_id} {label}"
+        text = f"{label} {conf:.2f}"
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         text_bg_y1 = max(0, y1 - th - 6)
         cv2.rectangle(frame, (x1, text_bg_y1), (x1 + tw, y1), color, -1)
@@ -430,6 +436,24 @@ def draw_tracks(frame: np.ndarray, track_results: list, trails: dict):
             lcx = int((lx1 + lx2) / 2)
             lcy = int((ly1 + ly2) / 2)
             cv2.circle(frame, (lcx, lcy), 6, color, 2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GT label helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def load_gt_labels(video_path: Path) -> tuple[list, list] | None:
+    """Load <stem>.json GT alongside the video if present.
+
+    Expected JSON keys:
+      exist   – list[int]  1 = target present, 0 = absent
+      gt_rect – list[[x, y, w, h]]  top-left pixel coords
+    """
+    json_path = video_path.with_suffix(".json")
+    if not json_path.exists():
+        return None
+    with open(json_path) as f:
+        data = json.load(f)
+    return data.get("exist", []), data.get("gt_rect", [])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -470,7 +494,7 @@ def choose_video_file() -> Path:
 def main():
     video_path = choose_video_file()
 
-    output_dir = PROJECT_ROOT / "runs" / "detect" / "wbf_tracking"
+    output_dir = PROJECT_ROOT / "runs" / "detect" / "inference"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{video_path.stem}_wbf_tracking.mp4"
 
@@ -514,7 +538,24 @@ def main():
         raise RuntimeError(f"Could not create output video: {output_path}")
 
     print(f"\n{'Input video:':<22}{video_path}")
-    print(f"{'Saving output to:':<22}{output_path}\n")
+    print(f"{'Saving output to:':<22}{output_path}")
+
+    # Ground-truth labels (optional)
+    gt_data    = load_gt_labels(video_path)
+    has_gt     = gt_data is not None
+    gt_exist: list = []
+    gt_rect:  list = []
+    if has_gt:
+        gt_exist, gt_rect = gt_data
+        print(f"{'GT labels:':<22}{video_path.stem}.json  ({len(gt_exist)} frames)")
+
+    print()
+
+    # Per-frame evaluation accumulators
+    frame_ious:     list[float] = []  # IoU vs GT per exist=1 frame
+    frame_dists:    list[float] = []  # centre distance per exist=1 frame
+    covered_frames: int = 0           # exist=1 frames where ≥1 track present
+    exist1_frames:  int = 0           # total exist=1 frames seen
 
     processed  = 0
     start_time = time.time()
@@ -528,10 +569,43 @@ def main():
         fused = run_wbf_on_frame(loaded_models, frame)
 
         # Stage 2 — Kalman + LSTM tracking
-        detections = [(d["box"], d["class_id"]) for d in fused]
+        detections = [(d["box"], d["class_id"], d["confidence"]) for d in fused]
         track_results = tracker.update(detections, width, height)
 
         draw_tracks(frame, track_results, tracker.trails)
+
+        # ── GT overlay + per-frame evaluation ───────────────────────────────
+        if has_gt and processed < len(gt_exist):
+            if gt_exist[processed] == 1:
+                rx, ry, rw, rh = gt_rect[processed]
+                gx1, gy1 = int(rx), int(ry)
+                gx2, gy2 = int(rx + rw), int(ry + rh)
+                cv2.rectangle(frame, (gx1, gy1), (gx2, gy2), (255, 255, 255), 2)
+                cv2.putText(
+                    frame, "GT", (gx1, max(12, gy1 - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1,
+                )
+
+                gt_xyxy = [float(rx), float(ry), float(rx + rw), float(ry + rh)]
+                gt_cx   = rx + rw / 2.0
+                gt_cy   = ry + rh / 2.0
+                exist1_frames += 1
+
+                best_iou  = 0.0
+                best_dist = float("inf")
+                for box_xyxy, _tid, _cls, _conf, _lstm in track_results:
+                    iou_val = _iou(box_xyxy, gt_xyxy)
+                    if iou_val > best_iou:
+                        best_iou  = iou_val
+                        tcx = (box_xyxy[0] + box_xyxy[2]) / 2.0
+                        tcy = (box_xyxy[1] + box_xyxy[3]) / 2.0
+                        best_dist = float(np.hypot(tcx - gt_cx, tcy - gt_cy))
+
+                frame_ious.append(best_iou)
+                frame_dists.append(best_dist)
+                if track_results:
+                    covered_frames += 1
+
         writer.write(frame)
 
         processed += 1
@@ -559,6 +633,70 @@ def main():
         print(f"Done. Processed {processed}/{total_frames} frames.")
     else:
         print(f"Done. Processed {processed} frames.")
+
+    # ── Evaluation summary ───────────────────────────────────────────────────
+    if has_gt and exist1_frames > 0:
+        iou_arr  = np.array(frame_ious,  dtype=np.float32)
+        dist_arr = np.array(frame_dists, dtype=np.float32)
+
+        thr_iou  = np.linspace(0.0, 1.0, 101)
+        success  = np.array([(iou_arr >= t).mean() for t in thr_iou], dtype=np.float32)
+        auc      = float(np.trapezoid(success, thr_iou))
+        sr50     = float((iou_arr >= 0.5).mean())
+
+        thr_dist = np.arange(0, 51, dtype=np.float32)
+        precision = np.array([(dist_arr <= t).mean() for t in thr_dist], dtype=np.float32)
+        prec20   = float((dist_arr <= 20.0).mean())
+        coverage = covered_frames / exist1_frames
+        mean_iou = float(iou_arr.mean())
+
+        sep = "─" * 52
+        print(f"\n{sep}")
+        print(f"  Evaluation  ({exist1_frames} present frames / {processed} total)")
+        print(sep)
+        print(f"  {'Mean IoU:':<32}{mean_iou * 100:.2f}%")
+        print(f"  {'Success Rate  @IoU≥0.5:':<32}{sr50 * 100:.2f}%")
+        print(f"  {'AUC  (success curve 0→1):':<32}{auc * 100:.2f}%")
+        print(f"  {'Precision  @20 px:':<32}{prec20 * 100:.2f}%")
+        print(f"  {'Coverage:':<32}{coverage * 100:.2f}%  ({covered_frames}/{exist1_frames})")
+        print(sep)
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+
+        ax1.plot(thr_iou, success, linewidth=2)
+        ax1.set_xlabel("IoU threshold")
+        ax1.set_ylabel("Success rate")
+        ax1.set_title(f"Success curve  AUC={auc:.3f}")
+        ax1.set_xlim(0, 1); ax1.set_ylim(0, 1)
+        ax1.grid(True, alpha=0.4)
+
+        ax2.plot(thr_dist, precision, linewidth=2)
+        ax2.axvline(20, color="gray", linestyle="--", linewidth=1, label="20 px")
+        ax2.set_xlabel("Centre distance threshold (px)")
+        ax2.set_ylabel("Precision")
+        ax2.set_title(f"Precision curve  @20px={prec20:.3f}")
+        ax2.set_xlim(0, 50); ax2.set_ylim(0, 1)
+        ax2.legend(); ax2.grid(True, alpha=0.4)
+
+        fig.tight_layout()
+        plot_path = output_dir / f"{video_path.stem}_wbf_eval.png"
+        fig.savefig(str(plot_path), dpi=120)
+        plt.close(fig)
+        print(f"\n  Eval plot → {plot_path}")
+
+        csv_path = output_dir / f"{video_path.stem}_wbf_eval.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["metric", "value", "value_percent", "note"])
+            writer.writerow(["mean_iou", mean_iou, mean_iou * 100.0, ""])
+            writer.writerow(["success_rate_iou_ge_0_5", sr50, sr50 * 100.0, "IoU >= 0.5"])
+            writer.writerow(["auc_success_curve_0_to_1", auc, auc * 100.0, ""])
+            writer.writerow(["precision_at_20px", prec20, prec20 * 100.0, "center distance <= 20"])
+            writer.writerow(["coverage", coverage, coverage * 100.0, f"{covered_frames}/{exist1_frames}"])
+            writer.writerow(["covered_frames", covered_frames, "", ""])
+            writer.writerow(["present_frames", exist1_frames, "", ""])
+            writer.writerow(["processed_frames", processed, "", ""])
+        print(f"  Eval csv  → {csv_path}")
 
 
 if __name__ == "__main__":
