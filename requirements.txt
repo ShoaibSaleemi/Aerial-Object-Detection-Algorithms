@@ -6,3 +6,5 @@ numpy
 pillow
 pyyaml
 questionary
+fpdf2
+reportlab
