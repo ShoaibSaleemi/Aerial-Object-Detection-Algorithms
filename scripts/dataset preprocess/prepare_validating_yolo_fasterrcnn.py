@@ -2,7 +2,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
+TOOLS_DIR = Path(__file__).resolve().parents[2] / "tools"
 
 scripts = [
     ("labels_validation_remap.py", "Remapping validation label IDs for evaluation"),

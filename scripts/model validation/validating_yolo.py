@@ -12,7 +12,7 @@ from ultralytics import YOLO
 import random
 import torch    
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 torch.manual_seed(0)
 np.random.seed(0)

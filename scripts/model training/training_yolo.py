@@ -1,13 +1,13 @@
 from ultralytics import YOLO
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 if __name__ == "__main__":
     # 1. Load a model
     # model = YOLO("yolov8n.yaml")  # build a new model from YAML (from scratch, not pretrained)
     # model = YOLO("yolov8n.yaml").load("yolo8n.pt")  # build from YAML and transfer weights
-    model = YOLO("yolo26n.pt")  # load a pretrained model
+    model = YOLO(str(PROJECT_ROOT / "yolo26n.pt"))  # load a pretrained model
 
     # 2. Train the model, https://docs.ultralytics.com/modes/train/#musgd-optimizer
     results = model.train(

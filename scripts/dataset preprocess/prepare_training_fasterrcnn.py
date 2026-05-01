@@ -2,7 +2,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
+TOOLS_DIR = Path(__file__).resolve().parents[2] / "tools"
 
 scripts = [
     ("filter_train_validation_ood.py", "Filtering OOD samples from train dataset"),
