@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 import sys
 from itertools import zip_longest
@@ -267,15 +268,7 @@ def compute_metrics_from_confusion(matrix):
         "F1-score": np.nanmean([m["F1-score"] for m in per_class_metrics]),
     }
 
-    total_known = int(matrix[:, 0].sum() + matrix[:, 1].sum())
-    total_unknown = int(matrix[:, 2].sum())
-    unknown_correct_rejections = int(matrix[2, 2])
-
-    summary_metrics = {
-        "Known objects": total_known,
-        "Unknown objects": total_unknown,
-        "Unknown correct rejections": unknown_correct_rejections,
-    }
+    summary_metrics = {}
 
     return per_class_metrics, macro_metrics, summary_metrics
 
@@ -334,10 +327,8 @@ def print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_me
         print(f"{left:<{left_width}}{' ' * gap}{right}")
 
 
-def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_path, title_prefix):
+def save_metrics_table_csv(per_class_metrics, macro_metrics, save_path):
     rows = []
-    columns = ["Class", "Precision", "Recall", "F1-score"]
-
     for m in per_class_metrics:
         rows.append([
             m["class"],
@@ -353,33 +344,12 @@ def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_p
         fmt_pct(macro_metrics["F1-score"]),
     ])
 
-    fig_h = 2.6 + 0.5 * len(rows)
-    fig, ax = plt.subplots(figsize=(13, fig_h))
-    ax.axis("off")
-    ax.set_title(f"{title_prefix} Evaluation Metrics Table", fontsize=14, pad=12)
-
-    table = ax.table(
-        cellText=rows,
-        colLabels=columns,
-        cellLoc="center",
-        loc="center",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 1.5)
-
-    footer_text = (
-        f"Known objects: {summary_metrics['Known objects']}    "
-        f"Unknown objects: {summary_metrics['Unknown objects']}    "
-        f"Unknown correct rejections: {summary_metrics['Unknown correct rejections']}"
-    )
-    fig.text(0.5, 0.03, footer_text, ha="center", fontsize=10)
-
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout(rect=[0.02, 0.08, 0.98, 0.98])
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    with save_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["Class", "Precision", "Recall", "F1-score"])
+        writer.writerows(rows)
 
 
 def main():
@@ -408,7 +378,7 @@ def main():
     run_display_name = format_run_display_name(run_name)
     model_path = str(detect_run_dir / "weights" / "best.pt")
     save_plot_path = str(detect_run_dir / "confusion_matrix_eval.png")
-    save_metrics_plot_path = str(detect_run_dir / "metrics_table_eval.png")
+    save_metrics_csv_path = str(detect_run_dir / "metrics_table_eval.csv")
 
     label_dir = LABELS_DIR
     if not label_dir.exists():
@@ -472,14 +442,12 @@ def main():
         plot_confusion(matrix, save_plot_path, run_display_name)
         print(f"Saved confusion matrix plot to {save_plot_path}")
 
-        plot_metrics_table(
+        save_metrics_table_csv(
             per_class_metrics=per_class_metrics,
             macro_metrics=macro_metrics,
-            summary_metrics=summary_metrics,
-            save_path=save_metrics_plot_path,
-            title_prefix=run_display_name,
+            save_path=save_metrics_csv_path,
         )
-        print(f"Saved metrics table plot to {save_metrics_plot_path}")
+        print(f"Saved metrics table CSV to {save_metrics_csv_path}")
 
 
 if __name__ == "__main__":
