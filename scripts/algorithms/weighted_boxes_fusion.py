@@ -38,6 +38,9 @@ MODELS = [
     ("yolo8n", PROJECT_ROOT / "runs" / "detect" / "yolo8n" / "weights" / "best.pt"),
     ("yolo9t", PROJECT_ROOT / "runs" / "detect" / "yolo9t" / "weights" / "best.pt"),
     ("yolo10n", PROJECT_ROOT / "runs" / "detect" / "yolo10n" / "weights" / "best.pt"),
+    ("yolo11n", PROJECT_ROOT / "runs" / "detect" / "yolo11n" / "weights" / "best.pt"),
+    ("yolo12n", PROJECT_ROOT / "runs" / "detect" / "yolo12n" / "weights" / "best.pt"),
+    ("yolo26n", PROJECT_ROOT / "runs" / "detect" / "yolo26n" / "weights" / "best.pt"),
 ]
 
 # Per-model per-class weighting for weighted voting / box fusion.
@@ -45,6 +48,9 @@ MODEL_WEIGHTS = {
     "yolo8n": {"bird": 1.000, "drone": 1.000, "unknown": 1.000},
     "yolo9t": {"bird": 1.000, "drone": 1.000, "unknown": 1.000},
     "yolo10n": {"bird": 1.000, "drone": 1.000, "unknown": 1.000},
+    "yolo11n": {"bird": 1.000, "drone": 1.000, "unknown": 1.000},
+    "yolo12n": {"bird": 1.000, "drone": 1.000, "unknown": 1.000},
+    "yolo26n": {"bird": 1.000, "drone": 1.000, "unknown": 1.000},
 }
 
 SAVE_PLOT = True
