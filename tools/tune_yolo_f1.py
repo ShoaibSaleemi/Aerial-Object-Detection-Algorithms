@@ -580,7 +580,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Bayesian optimization for per-model YOLO confidence threshold")
     parser.add_argument("--trials", type=int, default=50, help="Number of optimization trials per model")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--model", type=str, default="yolo9t", help="Only tune one model name (run folder name)")
+    parser.add_argument("--model", type=str, default="yolo8n", help="Only tune one model name (run folder name)")
     parser.add_argument("--min-conf", type=float, default=0.55, help="Lower bound for confidence threshold")
     parser.add_argument("--max-conf", type=float, default=0.75, help="Upper bound for confidence threshold")
     args = parser.parse_args()
