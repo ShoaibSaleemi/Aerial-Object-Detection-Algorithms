@@ -3,6 +3,7 @@ Bayesian optimization hyperparameter tuning for the WBF + Kalman tracking pipeli
 
 Loads ensemble models once, then uses Optuna's TPE sampler to tune:
   - CONF_THRESH, FUSION_IOU_THRESH
+    - Per-model confidence thresholds (conf_yolo8n, conf_yolo11n, conf_yolo26n)
   - MIN_MODEL_SUPPORT, KNOWN_FUSED_CONF_THRESH, SCORE_MARGIN_THRESH, DISAGREEMENT_RATIO_THRESH
   - MAX_LOST, MIN_HITS, IOU_THRESH_TRACK, SEQ_LEN
   - Kalman noise parameters (R, Q_vel, P_vel)
@@ -54,6 +55,12 @@ W_AUC    = 0.40
 W_SR50   = 0.30
 W_PREC20 = 0.30
 
+# One-time cache inference threshold. Trials later apply CONF_THRESH filtering
+# on cached detections, so this must stay very low.
+CONF_INFER = 0.001
+MODEL_CONF_RANGE = (0.30, 0.85)
+TARGET_MODEL_NAMES = ("yolo8n", "yolo11n", "yolo26n")
+
 _INLINE_STATUS_LEN = 0
 
 
@@ -76,6 +83,14 @@ def _finish_inline_status_line() -> None:
     _INLINE_STATUS_LEN = 0
 
 
+def _safe_best_trial(study_obj: optuna.Study):
+    """Return best trial or None when no completed trial exists yet."""
+    try:
+        return study_obj.best_trial
+    except ValueError:
+        return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Load GT once
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,7 +105,14 @@ def load_gt(json_path: Path) -> tuple[list, list]:
 # ─────────────────────────────────────────────────────────────────────────────
 def load_models() -> list:
     loaded = []
-    for model_name, model_path in inf.MODELS:
+    candidate_paths = {
+        model_name: model_path for model_name, model_path in inf.MODELS
+    }
+    for model_name in TARGET_MODEL_NAMES:
+        model_path = candidate_paths.get(
+            model_name,
+            PROJECT_ROOT / "runs" / "detect" / model_name / "weights" / "best.pt",
+        )
         if not model_path.exists():
             print(f"  [SKIP] {model_name}: not found at {model_path}")
             continue
@@ -100,7 +122,7 @@ def load_models() -> list:
         loaded.append((model_name, model, class_map))
         print(f"  [OK]   {model_name}")
     if not loaded:
-        raise RuntimeError("No ensemble models loaded. Check MODELS paths.")
+        raise RuntimeError("No target ensemble models loaded. Check model paths.")
     return loaded
 
 
@@ -129,28 +151,146 @@ def _make_kalman_init(r_noise: float, q_vel: float, p_vel: float):
     return _new_init
 
 
+def _fuse_from_cached_raw(frame_raw_dets: list[dict]) -> list[dict]:
+    """Build fused detections from cached model detections for one frame."""
+    all_detections: list[dict] = []
+    model_conf_thresh = getattr(inf, "MODEL_CONF_THRESH", {})
+    global_conf_thresh = float(getattr(inf, "CONF_THRESH", 0.0))
+
+    for det in frame_raw_dets:
+        per_model_thresh = float(model_conf_thresh.get(det["model"], global_conf_thresh))
+        effective_thresh = max(global_conf_thresh, per_model_thresh)
+        if det["confidence"] < effective_thresh:
+            continue
+        cls_name = inf.class_name_from_id(int(det["class_id"]))
+        mw = inf.MODEL_WEIGHTS.get(det["model"], {}).get(cls_name, 1.0)
+        all_detections.append({
+            "box": det["box"],
+            "class_id": det["class_id"],
+            "confidence": det["confidence"],
+            "model": det["model"],
+            "weighted_score": float(mw * det["confidence"]),
+        })
+
+    if not all_detections:
+        return []
+
+    fused: list[dict] = []
+    for cluster in inf.cluster_detections(all_detections, inf.FUSION_IOU_THRESH):
+        item = inf.fuse_cluster(cluster)
+        if item is not None:
+            fused.append(item)
+    return fused
+
+
+def cache_sequence_detections(
+    loaded_models: list,
+    sequence_specs: list[tuple[Path, list, list]],
+    sim_start_time: float,
+) -> list[dict]:
+    """Run ensemble inference once over all frames and cache raw detections."""
+    cached_sequences: list[dict] = []
+    n_seq = len(sequence_specs)
+
+    for seq_idx, (video_path, gt_exist, gt_rect) in enumerate(sequence_specs, 1):
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video for caching: {video_path}")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frames_raw: list[list[dict]] = []
+        processed = 0
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            frame_raw: list[dict] = []
+            for model_name, model, class_map in loaded_models:
+                predict_kwargs = {
+                    "source": frame,
+                    "conf": CONF_INFER,
+                    "imgsz": inf.IMG_SIZE,
+                    "save": False,
+                    "show": False,
+                    "verbose": False,
+                }
+                if inf.DEVICE:
+                    predict_kwargs["device"] = inf.DEVICE
+
+                results = model.predict(**predict_kwargs)
+                r = results[0] if isinstance(results, list) else results
+
+                if not hasattr(r, "boxes") or len(r.boxes) == 0:
+                    continue
+
+                boxes_xyxy = r.boxes.xyxy.cpu().numpy()
+                class_ids = r.boxes.cls.cpu().numpy().astype(int)
+                confidences = r.boxes.conf.cpu().numpy().astype(float)
+
+                for box, cls_id, conf in zip(boxes_xyxy, class_ids, confidences):
+                    cls_name = class_map.get(int(cls_id), inf.class_name_from_id(int(cls_id)))
+                    cls_idx = 0 if cls_name == "bird" else 1 if cls_name == "drone" else 2
+                    frame_raw.append({
+                        "box": [float(v) for v in box.tolist()],
+                        "class_id": int(cls_idx),
+                        "confidence": float(conf),
+                        "model": model_name,
+                    })
+
+            frames_raw.append(frame_raw)
+            processed += 1
+
+            elapsed_total = time.time() - sim_start_time
+            t_hour, t_rem = divmod(int(elapsed_total), 3600)
+            t_min, t_sec = divmod(t_rem, 60)
+            elapsed_str = f"{t_hour}:{t_min:02d}:{t_sec:02d}"
+            pct = (processed / total_frames * 100.0) if total_frames > 0 else 0.0
+            _print_inline_status(
+                f"  Caching Video {seq_idx}/{n_seq} | Frame {processed}/{total_frames} ({pct:.1f}%)"
+                f" | Elapsed: {elapsed_str}"
+            )
+
+        cap.release()
+        cached_sequences.append(
+            {
+                "video_path": video_path,
+                "gt_exist": gt_exist,
+                "gt_rect": gt_rect,
+                "width": width,
+                "height": height,
+                "frames_raw": frames_raw,
+            }
+        )
+
+    _finish_inline_status_line()
+    return cached_sequences
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Evaluation loop (no video writing)
 # ─────────────────────────────────────────────────────────────────────────────
-def evaluate(loaded_models: list, video_path: Path, gt_exist: list, gt_rect: list,
+def evaluate(seq_cache: dict,
              lstm_device: torch.device, seq_idx: int | None = None,
              total_seq: int | None = None,
              sim_start_time: float | None = None,
              label: str = "") -> dict:
-    """Run the full pipeline on a single video and return evaluation metrics."""
+    """Run the full pipeline on one cached video and return evaluation metrics."""
 
     # Reset track ID counter so each trial starts fresh
     inf.KalmanBoxTracker._next_id = 0
 
     tracker = inf.MultiObjectTracker(lstm_device=lstm_device)
 
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {video_path}")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    gt_exist = seq_cache["gt_exist"]
+    gt_rect = seq_cache["gt_rect"]
+    width = int(seq_cache["width"])
+    height = int(seq_cache["height"])
+    frames_raw = seq_cache["frames_raw"]
+    total_frames = len(frames_raw)
 
     frame_ious:     list[float] = []
     frame_dists:    list[float] = []
@@ -158,12 +298,8 @@ def evaluate(loaded_models: list, video_path: Path, gt_exist: list, gt_rect: lis
     exist1_frames:  int = 0
     processed:      int = 0
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-
-        fused      = inf.run_wbf_on_frame(loaded_models, frame)
+    for frame_raw in frames_raw:
+        fused      = _fuse_from_cached_raw(frame_raw)
         detections = [(d["box"], d["class_id"], d["confidence"]) for d in fused]
         track_results = tracker.update(detections, width, height)
 
@@ -198,17 +334,8 @@ def evaluate(loaded_models: list, video_path: Path, gt_exist: list, gt_rect: lis
         video_prefix = ""
         if seq_idx is not None and total_seq is not None:
             video_prefix = f"Video {seq_idx}/{total_seq} | "
-        if total_frames > 0:
-            pct = processed / total_frames * 100
-            status = (
-                f"    {trial_prefix}{video_prefix}Frame: {processed}/{total_frames} ({pct:.1f}%)"
-                f" | Elapsed: {elapsed_str}"
-            )
-        else:
-            status = f"    {trial_prefix}{video_prefix}Frame: {processed} | Elapsed: {elapsed_str}"
+        status = f"    {trial_prefix}{video_prefix}Elapsed: {elapsed_str}"
         _print_inline_status(status)
-
-    cap.release()
 
     if exist1_frames == 0:
         return {"auc": 0.0, "sr50": 0.0, "prec20": 0.0, "coverage": 0.0, "score": 0.0}
@@ -237,8 +364,7 @@ def evaluate(loaded_models: list, video_path: Path, gt_exist: list, gt_rect: lis
 # ─────────────────────────────────────────────────────────────────────────────
 # Multi-sequence evaluation — average metrics across all validation sequences
 # ─────────────────────────────────────────────────────────────────────────────
-def evaluate_all(loaded_models: list,
-                 sequences: list[tuple[Path, list, list]],
+def evaluate_all(cached_sequences: list[dict],
                  lstm_device: torch.device,
                  sim_start_time: float | None = None,
                  trial_label: str = "") -> dict:
@@ -247,14 +373,11 @@ def evaluate_all(loaded_models: list,
     totals = {k: 0.0 for k in keys}
     valid  = 0
 
-    n_seq = len(sequences)
-    for i, (video_path, gt_exist, gt_rect) in enumerate(sequences, 1):
+    n_seq = len(cached_sequences)
+    for i, seq_cache in enumerate(cached_sequences, 1):
         try:
             m = evaluate(
-                loaded_models,
-                video_path,
-                gt_exist,
-                gt_rect,
+                seq_cache,
                 lstm_device,
                 seq_idx=i,
                 total_seq=n_seq,
@@ -279,8 +402,7 @@ def evaluate_all(loaded_models: list,
 # Optuna objective — called once per trial
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_trial(trial: optuna.Trial,
-               loaded_models: list,
-               sequences: list,
+               cached_sequences: list[dict],
                lstm_device: torch.device,
                total_trials: int,
                sim_start_time: float) -> float:
@@ -298,18 +420,28 @@ def _run_trial(trial: optuna.Trial,
     kalman_r         = trial.suggest_float("kalman_r",         0.5,  20.0)
     kalman_q_vel     = trial.suggest_float("kalman_q_vel",     1e-4, 0.50, log=True)
     kalman_p_vel     = trial.suggest_float("kalman_p_vel",     10.0, 5000.0, log=True)
+    conf_yolo8n      = trial.suggest_float("conf_yolo8n",      *MODEL_CONF_RANGE)
+    conf_yolo11n     = trial.suggest_float("conf_yolo11n",     *MODEL_CONF_RANGE)
+    conf_yolo26n     = trial.suggest_float("conf_yolo26n",     *MODEL_CONF_RANGE)
     w_yolo8n         = trial.suggest_float("w_yolo8n",         0.5,  2.0)
-    w_yolo9t         = trial.suggest_float("w_yolo9t",         0.5,  2.0)
-    w_yolo10n        = trial.suggest_float("w_yolo10n",        0.5,  2.0)
+    w_yolo11n        = trial.suggest_float("w_yolo11n",        0.5,  2.0)
+    w_yolo26n        = trial.suggest_float("w_yolo26n",        0.5,  2.0)
+
+    model_conf_thresh = {
+        "yolo8n": float(conf_yolo8n),
+        "yolo11n": float(conf_yolo11n),
+        "yolo26n": float(conf_yolo26n),
+    }
 
     model_weights = {
         "yolo8n":  {"bird": w_yolo8n,  "drone": w_yolo8n,  "unknown": w_yolo8n},
-        "yolo9t":  {"bird": w_yolo9t,  "drone": w_yolo9t,  "unknown": w_yolo9t},
-        "yolo10n": {"bird": w_yolo10n, "drone": w_yolo10n, "unknown": w_yolo10n},
+        "yolo11n": {"bird": w_yolo11n, "drone": w_yolo11n, "unknown": w_yolo11n},
+        "yolo26n": {"bird": w_yolo26n, "drone": w_yolo26n, "unknown": w_yolo26n},
     }
 
     _patch_globals({
         "CONF_THRESH":               conf_thresh,
+        "MODEL_CONF_THRESH":         model_conf_thresh,
         "FUSION_IOU_THRESH":         fusion_iou,
         "MIN_MODEL_SUPPORT":         min_support,
         "KNOWN_FUSED_CONF_THRESH":   known_conf,
@@ -325,8 +457,7 @@ def _run_trial(trial: optuna.Trial,
 
     trial_label = f"Trial {trial.number + 1}/{total_trials}:"
     metrics = evaluate_all(
-        loaded_models,
-        sequences,
+        cached_sequences,
         lstm_device,
         sim_start_time=sim_start_time,
         trial_label=trial_label,
@@ -345,7 +476,7 @@ def _run_trial(trial: optuna.Trial,
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Bayesian optimization for WBF+Kalman tracker")
-    parser.add_argument("--trials", type=int, default=50, help="Number of optimization trials")
+    parser.add_argument("--trials", type=int, default=1000, help="Number of optimization trials")
     parser.add_argument("--seed",   type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
@@ -361,7 +492,7 @@ def main():
     print()
 
     print("Discovering validation sequences...")
-    sequences: list[tuple[Path, list, list]] = []
+    sequence_specs: list[tuple[Path, list, list]] = []
     for seq_dir in sorted(VAL_VIDEOS_DIR.iterdir()):
         video_path = seq_dir / "visible.mp4"
         gt_path    = seq_dir / "visible.json"
@@ -369,10 +500,10 @@ def main():
             print(f"  [SKIP] {seq_dir.name}: missing video or GT")
             continue
         gt_exist, gt_rect = load_gt(gt_path)
-        sequences.append((video_path, gt_exist, gt_rect))
-    if not sequences:
+        sequence_specs.append((video_path, gt_exist, gt_rect))
+    if not sequence_specs:
         raise RuntimeError("No valid validation sequences found.")
-    print(f"  {len(sequences)} sequences loaded")
+    print(f"  {len(sequence_specs)} sequences loaded")
 
     print("\nLoading ensemble models...")
     loaded_models = load_models()
@@ -390,8 +521,9 @@ def main():
     try:
         study = optuna.load_study(study_name=study_name, storage=storage)
         print(f"\n  [RESUME] Found existing study with {len(study.trials)} completed trial(s).")
-        if study.best_trial is not None:
-            print(f"           Best score so far: {-study.best_trial.value:.4f}")
+        _resume_best = _safe_best_trial(study)
+        if _resume_best is not None:
+            print(f"           Best score so far: {-_resume_best.value:.4f}")
         start_trial = len(study.trials) + 1
     except KeyError:
         sampler = TPESampler(seed=args.seed)
@@ -406,9 +538,15 @@ def main():
 
     if len(study.trials) >= args.trials:
         print(f"\n  All {args.trials} trials already completed. Delete {OPTUNA_DB} to restart.")
-        if study.best_trial is not None:
-            print(f"  Best score: {-study.best_trial.value:.4f}")
+        _done_best = _safe_best_trial(study)
+        if _done_best is not None:
+            print(f"  Best score: {-_done_best.value:.4f}")
         return
+
+    print("\nCaching detections once (GPU pass) for all validation videos...")
+    cache_start_time = time.time()
+    cached_sequences = cache_sequence_detections(loaded_models, sequence_specs, cache_start_time)
+    print(f"  Cache ready for {len(cached_sequences)} sequence(s). Trials now run CPU-only fusion/tracking.")
 
     print(f"\nStarting optimization ({args.trials} trials, resuming from trial {start_trial})...\n")
 
@@ -418,21 +556,22 @@ def main():
     sim_start_time = time.time()
 
     # Seed best score so only genuinely new bests are flagged on resume.
-    prior_best_score = -study.best_trial.value if study.best_trial is not None else -float("inf")
-    if study.best_trial is not None:
+    _prior_best = _safe_best_trial(study)
+    prior_best_score = -_prior_best.value if _prior_best is not None else -float("inf")
+    if _prior_best is not None:
         print(f"  [RESUME] Prior best score: {prior_best_score:.4f}")
 
     def save_best_json(study_obj: optuna.Study) -> None:
         """Write only the best params to JSON (no history)."""
-        if study_obj.best_trial is None:
+        bt = _safe_best_trial(study_obj)
+        if bt is None:
             return
-        bt    = study_obj.best_trial
         bp    = bt.params
         score = -bt.value
         model_weights = {
             "yolo8n":  {"bird": bp["w_yolo8n"],  "drone": bp["w_yolo8n"],  "unknown": bp["w_yolo8n"]},
-            "yolo9t":  {"bird": bp["w_yolo9t"],  "drone": bp["w_yolo9t"],  "unknown": bp["w_yolo9t"]},
-            "yolo10n": {"bird": bp["w_yolo10n"], "drone": bp["w_yolo10n"], "unknown": bp["w_yolo10n"]},
+            "yolo11n": {"bird": bp["w_yolo11n"], "drone": bp["w_yolo11n"], "unknown": bp["w_yolo11n"]},
+            "yolo26n": {"bird": bp["w_yolo26n"], "drone": bp["w_yolo26n"], "unknown": bp["w_yolo26n"]},
         }
         output = {
             "score":   score,
@@ -444,6 +583,11 @@ def main():
             },
             "params": {
                 "CONF_THRESH":               bp["conf_thresh"],
+                "MODEL_CONF_THRESH": {
+                    "yolo8n": bp.get("conf_yolo8n", bp["conf_thresh"]),
+                    "yolo11n": bp.get("conf_yolo11n", bp["conf_thresh"]),
+                    "yolo26n": bp.get("conf_yolo26n", bp["conf_thresh"]),
+                },
                 "FUSION_IOU_THRESH":         bp["fusion_iou"],
                 "MIN_MODEL_SUPPORT":         bp["min_support"],
                 "KNOWN_FUSED_CONF_THRESH":   bp["known_conf"],
@@ -465,9 +609,10 @@ def main():
 
     def on_trial_complete(study_obj: optuna.Study, frozen: optuna.trial.FrozenTrial) -> None:
         score   = -frozen.value
+        best_now = _safe_best_trial(study_obj)
         is_best = (
-            study_obj.best_trial is not None
-            and study_obj.best_trial.number == frozen.number
+            best_now is not None
+            and best_now.number == frozen.number
             and score > prior_best_score
         )
         auc    = frozen.user_attrs.get("auc",    0.0)
@@ -489,7 +634,7 @@ def main():
         save_best_json(study_obj)
 
     def objective(trial: optuna.Trial) -> float:
-        return _run_trial(trial, loaded_models, sequences, lstm_device, args.trials, sim_start_time)
+        return _run_trial(trial, cached_sequences, lstm_device, args.trials, sim_start_time)
 
     study.optimize(
         objective,
@@ -499,7 +644,7 @@ def main():
     )
 
     # ── Final summary ──────────────────────────────────────────────────────
-    best_trial = study.best_trial
+    best_trial = _safe_best_trial(study)
     if best_trial is None:
         raise RuntimeError("No trials completed.")
 
