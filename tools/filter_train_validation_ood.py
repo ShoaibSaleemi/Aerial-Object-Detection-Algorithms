@@ -48,7 +48,7 @@ for label_dir, image_dir in dataset_splits:
             elapsed = time.time() - start_time
             minutes, seconds = divmod(int(elapsed), 60)
             print(
-                f"Progress: {processed}/{total_files} ({processed / total_files * 100:.2f}%) "
+                f"Progress: {processed}/{total_files} ({processed / total_files * 100:.1f}%) "
                 f"Elapsed: {minutes}:{seconds:02d}",
                 end="\r",
             )
