@@ -13,8 +13,8 @@ The "unknown" class is a remapping of any label index other than 0 (bird) or
 Target models: yolo8n, yolo9t, yolo10n, yolo11n, yolo12n, yolo26n
 
 Usage:
-    python "tools/tune_yolo_mean_average_precision.py"
-    python "tools/tune_yolo_mean_average_precision.py" --model yolo8n
+    python "tools/eval_yolo_map50.py"
+    python "tools/eval_yolo_map50.py" --model yolo8n
 """
 
 import argparse
