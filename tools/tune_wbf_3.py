@@ -11,8 +11,8 @@ Loads ensemble models once, then uses Optuna's TPE sampler to tune:
 Optimizes macro-averaged F1 score on validation images.
 
 Usage:
-    python "tools/tune_weighted_boxes_fusion.py"
-    python "tools/tune_weighted_boxes_fusion.py" --trials 50 --seed 42
+    python "tools/tune_wbf_3.py"
+    python "tools/tune_wbf_3.py" --trials 50 --seed 42
 """
 
 import argparse
@@ -29,11 +29,11 @@ from optuna.samplers import TPESampler
 
 # ── resolve paths ─────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WBF_PATH = PROJECT_ROOT / "scripts" / "algorithms" / "weighted_boxes_fusion.py"
+WBF_PATH = PROJECT_ROOT / "scripts" / "algorithms" / "weighted_boxes_fusion_3.py"
 if not WBF_PATH.exists():
     raise FileNotFoundError(f"WBF script not found: {WBF_PATH}")
 
-_spec = importlib.util.spec_from_file_location("weighted_boxes_fusion", WBF_PATH)
+_spec = importlib.util.spec_from_file_location("weighted_boxes_fusion_3", WBF_PATH)
 if _spec is None or _spec.loader is None:
     raise ImportError(f"Cannot create import spec for: {WBF_PATH}")
 wbf = importlib.util.module_from_spec(_spec)
@@ -43,8 +43,21 @@ _spec.loader.exec_module(wbf)
 IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
 LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
 
-BEST_JSON = PROJECT_ROOT / "runs" / "detect" / "tune_wbf" / "best_params_bayesian.json"
-OPTUNA_DB = PROJECT_ROOT / "runs" / "detect" / "tune_wbf" / "optuna_study.db"
+BEST_JSON = PROJECT_ROOT / "runs" / "detect" / "tune_wbf_3" / "best_params_bayesian_3.json"
+OPTUNA_DB = PROJECT_ROOT / "runs" / "detect" / "tune_wbf_3" / "optuna_study_3.db"
+
+# ── Tuning search ranges ──────────────────────────────────────────────────────
+MIN_SUPPORT_RANGE   = (1, 3)          # (min, max) int
+KNOWN_CONF_RANGE    = (0.30, 0.90)    # (min, max) float
+SCORE_MARGIN_RANGE  = (0.00, 1.00)    # (min, max) float
+DISAGREEMENT_RANGE  = (0.00, 1.00)    # (min, max) float
+MODEL_WEIGHT_RANGE  = (0.50, 2.00)    # (min, max) float, per-model per-class
+
+# ── Initial / baseline parameter values (sourced from weighted_boxes_fusion_3.py) ─
+INIT_MIN_SUPPORT   = wbf.MIN_MODEL_SUPPORT
+INIT_KNOWN_CONF    = wbf.KNOWN_FUSED_CONF_THRESH
+INIT_SCORE_MARGIN  = wbf.SCORE_MARGIN_THRESH
+INIT_DISAGREEMENT  = wbf.DISAGREEMENT_RATIO_THRESH
 
 # Model names in order (must match wbf.MODELS)
 MODEL_NAMES = [name for name, _ in wbf.MODELS]
@@ -124,7 +137,7 @@ def compute_f1_score(loaded_models: list, image_paths: list, valid_label_paths: 
         t_min, t_sec = divmod(t_rem, 60)
         elapsed_str = f"{t_hour}:{t_min:02d}:{t_sec:02d}"
         prefix = f"{label} " if label else ""
-        status = f"    {prefix}{idx}/{total_files} ({pct:.1f}%) | Elapsed: {elapsed_str}"
+        status = f"{prefix}{idx}/{total_files} ({pct:.1f}%) | Elapsed: {elapsed_str}"
         _print_inline_status(status)
     
     # Compute confusion matrix and metrics
@@ -264,6 +277,14 @@ class OptimizationTracker:
         _finish_inline_status_line()
 
 
+def _get_best_trial(study: optuna.Study):
+    """Return study.best_trial or None when no completed trials exist yet."""
+    try:
+        return study.best_trial
+    except ValueError:
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Bayesian optimization for weighted boxes fusion")
     parser.add_argument("--trials", type=int, default=50, help="Number of optimization trials")
@@ -276,7 +297,7 @@ def main():
         raise FileNotFoundError(f"Labels dir not found: {LABELS_DIR}")
     
     print("=" * 70)
-    print("  Weighted Boxes Fusion — Bayesian Optimization Tuner (Optuna TPE)")
+    print("  Weighted Boxes Fusion (Top-3) — Bayesian Optimization Tuner (Optuna TPE)")
     print("=" * 70)
     print(f"  Images dir: {IMAGES_DIR}")
     print(f"  Labels dir: {LABELS_DIR}")
@@ -319,10 +340,10 @@ def main():
     
     # Build initial point with defaults
     init_params = {
-        "min_support": 3,
-        "known_conf": 0.55,
-        "score_margin": 0.20,
-        "disagreement": 0.55,
+        "min_support": INIT_MIN_SUPPORT,
+        "known_conf":  INIT_KNOWN_CONF,
+        "score_margin": INIT_SCORE_MARGIN,
+        "disagreement": INIT_DISAGREEMENT,
     }
     
     # Add initial weights from baseline analysis
@@ -334,7 +355,7 @@ def main():
     opt_start_time = time.time()
     print("Evaluating initial point...")
     x0_weights = [init_weights[model_name][class_name] for model_name in MODEL_NAMES for class_name in CLASS_NAMES]
-    params_init = _encode_params(3, 0.55, 0.20, 0.55, x0_weights)
+    params_init = _encode_params(INIT_MIN_SUPPORT, INIT_KNOWN_CONF, INIT_SCORE_MARGIN, INIT_DISAGREEMENT, x0_weights)
     _patch_globals(params_init)
     y0_neg, y0_precision, y0_recall, y0_f1 = compute_f1_score(
         loaded_models,
@@ -356,12 +377,13 @@ def main():
     storage = optuna.storages.RDBStorage(f"sqlite:///{OPTUNA_DB}")
     
     # Check if study exists
-    study_name = "wbf_bayesian_optimization"
+    study_name = "wbf_bayesian_optimization_3"
     try:
         study = optuna.load_study(study_name=study_name, storage=storage)
         print(f"\n  [RESUME] Found existing study with {len(study.trials)} completed trial(s).")
-        if study.best_trial is not None:
-            print(f"           Best F1 score so far: {-study.best_trial.value:.4f}")
+        _bt = _get_best_trial(study)
+        if _bt is not None:
+            print(f"           Best F1 score so far: {-_bt.value:.4f}")
         start_trial = len(study.trials) + 1
     except KeyError:
         # Create new study with TPE sampler
@@ -378,8 +400,9 @@ def main():
     # Check if already completed
     if len(study.trials) >= args.trials:
         print(f"\n  All {args.trials} trials already completed. Delete {OPTUNA_DB} to restart.")
-        if study.best_trial is not None:
-            best_f1 = -study.best_trial.value
+        _bt = _get_best_trial(study)
+        if _bt is not None:
+            best_f1 = -_bt.value
             print(f"  Best F1 score: {best_f1:.4f}")
         return
     
@@ -389,8 +412,9 @@ def main():
     tracker = OptimizationTracker(sim_start_time)
 
     # Seed tracker with best score already in the study (so resume doesn't re-announce old bests)
-    if study.best_trial is not None:
-        prior_best_f1 = -study.best_trial.value
+    _prior_bt = _get_best_trial(study)
+    if _prior_bt is not None:
+        prior_best_f1 = -_prior_bt.value
         tracker.best_f1 = prior_best_f1
         prior_p, prior_r = 0.0, 0.0
         if BEST_JSON.exists():
@@ -404,10 +428,10 @@ def main():
 
     def save_best_json_snapshot(study_obj: optuna.Study) -> None:
         """Persist current best parameters so progress is visible on disk during runs."""
-        if study_obj.best_trial is None:
+        best_trial_obj = _get_best_trial(study_obj)
+        if best_trial_obj is None:
             return
 
-        best_trial_obj = study_obj.best_trial
         best_f1_obj = -best_trial_obj.value
         best_params_obj = best_trial_obj.params
 
@@ -446,16 +470,16 @@ def main():
     # Define objective function with closure
     def objective(trial: optuna.Trial) -> float:
         # Suggest parameters
-        min_support = trial.suggest_int("min_support", 1, 6)
-        known_conf = trial.suggest_float("known_conf", 0.3, 0.9)
-        score_margin = trial.suggest_float("score_margin", 0.0, 1.0)
-        disagreement = trial.suggest_float("disagreement", 0.0, 1.0)
+        min_support = trial.suggest_int(  "min_support", *MIN_SUPPORT_RANGE)
+        known_conf  = trial.suggest_float("known_conf",   *KNOWN_CONF_RANGE)
+        score_margin = trial.suggest_float("score_margin", *SCORE_MARGIN_RANGE)
+        disagreement = trial.suggest_float("disagreement", *DISAGREEMENT_RANGE)
         
         # Suggest weights for each model and class
         weights_list = []
         for model_name in MODEL_NAMES:
             for class_name in CLASS_NAMES:
-                w = trial.suggest_float(f"w_{model_name}_{class_name}", 0.5, 2.0)
+                w = trial.suggest_float(f"w_{model_name}_{class_name}", *MODEL_WEIGHT_RANGE)
                 weights_list.append(w)
         
         # Encode and patch parameters
@@ -494,7 +518,7 @@ def main():
     tracker.finalize()
     
     # ── Extract best result ───────────────────────────────────────────────────
-    best_trial = study.best_trial
+    best_trial = _get_best_trial(study)
     if best_trial is None:
         raise RuntimeError("No trials completed.")
     

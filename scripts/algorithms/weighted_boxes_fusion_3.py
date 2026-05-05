@@ -1,4 +1,5 @@
 import csv
+import json
 from pathlib import Path
 import random
 import time
@@ -23,40 +24,49 @@ IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
 LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
 IOU_THRESH = 0.5
 CONF_THRESH = 0.70
+MODEL_CONF_THRESH = {
+    "yolo9t": 0.70,
+    "yolo11n": 0.712997868833143,
+    "yolo26n": 0.6052508580184951
+}
 FUSION_IOU_THRESH = 0.50
 IMGSZ = 640
 DEVICE = ""  # "cpu", "0", "0,1"; empty lets Ultralytics auto-select.
 
-# Unknown-decision thresholds (applied after known-class weighted voting).
-MIN_MODEL_SUPPORT = 5
-KNOWN_FUSED_CONF_THRESH = 0.5601453198085411
-SCORE_MARGIN_THRESH = 0.09125076880326494
-DISAGREEMENT_RATIO_THRESH = 0.15533651974598006
-
-# Per-model per-class weighting for weighted voting / box fusion.
-MODEL_WEIGHTS = {
-    "yolo8n":  {"bird": 1.0814851758318496,  "drone": 1.1806397062045533,  "unknown": 1.5854956737557213},
-    "yolo9t":  {"bird": 1.1648048860139104,  "drone": 1.9507533272268047,  "unknown": 1.5176441781892689},
-    "yolo10n": {"bird": 1.012484828994974,   "drone": 1.238554113695587,   "unknown": 0.9796306541223246},
-    "yolo11n": {"bird": 1.2533830034169342,  "drone": 1.1708816661545447,  "unknown": 0.9072305499609367},
-    "yolo12n": {"bird": 1.2217564703689683,  "drone": 1.703242413959964,   "unknown": 1.5846263992743486},
-    "yolo26n": {"bird": 0.7438992484903112,  "drone": 1.0219630042404741,  "unknown": 1.585134798429956},
+# Unknown-decision thresholds and model weights — loaded from tuner output if available.
+_BEST_PARAMS_JSON = PROJECT_ROOT / "runs" / "detect" / "tune_wbf" / "best_params_bayesian_3.json"
+_defaults = {
+    "MIN_MODEL_SUPPORT": 2,
+    "KNOWN_FUSED_CONF_THRESH": 0.68770202403814,
+    "SCORE_MARGIN_THRESH": 0.5582857958051067,
+    "DISAGREEMENT_RATIO_THRESH": 0.15223066760019896,
+    "MODEL_WEIGHTS": {
+        "yolo9t":  {"bird": 1.3345783180967155,  "drone": 1.3246461700191348,  "unknown": 1.4472517946232146},
+        "yolo11n": {"bird": 1.3215138210731259,  "drone": 1.9403016932408828,  "unknown": 1.338899849846067},
+        "yolo26n": {"bird": 1.3364625610235248,  "drone": 1.1804482074749882,  "unknown": 1.746577505269269},
+    },
 }
+if _BEST_PARAMS_JSON.exists():
+    _loaded = json.loads(_BEST_PARAMS_JSON.read_text()).get("params", {})
+    _defaults.update({k: v for k, v in _loaded.items() if k in _defaults})
+
+MIN_MODEL_SUPPORT          = _defaults["MIN_MODEL_SUPPORT"]
+KNOWN_FUSED_CONF_THRESH    = _defaults["KNOWN_FUSED_CONF_THRESH"]
+SCORE_MARGIN_THRESH        = _defaults["SCORE_MARGIN_THRESH"]
+DISAGREEMENT_RATIO_THRESH  = _defaults["DISAGREEMENT_RATIO_THRESH"]
+MODEL_WEIGHTS              = _defaults["MODEL_WEIGHTS"]
 
 # Ensemble model list: (name, path_to_weights)
 MODELS = [
-    ("yolo8n", PROJECT_ROOT / "runs" / "detect" / "yolo8n" / "weights" / "best.pt"),
-    ("yolo9t", PROJECT_ROOT / "runs" / "detect" / "yolo9t" / "weights" / "best.pt"),
-    ("yolo10n", PROJECT_ROOT / "runs" / "detect" / "yolo10n" / "weights" / "best.pt"),
+    ("yolo9t",  PROJECT_ROOT / "runs" / "detect" / "yolo9t"  / "weights" / "best.pt"),
     ("yolo11n", PROJECT_ROOT / "runs" / "detect" / "yolo11n" / "weights" / "best.pt"),
-    ("yolo12n", PROJECT_ROOT / "runs" / "detect" / "yolo12n" / "weights" / "best.pt"),
     ("yolo26n", PROJECT_ROOT / "runs" / "detect" / "yolo26n" / "weights" / "best.pt"),
 ]
 
 SAVE_PLOT = True
 VERBOSE = False
 
-OUTPUT_DIR = PROJECT_ROOT / "runs" / "detect" / "weighted_voter"
+OUTPUT_DIR = PROJECT_ROOT / "runs" / "detect" / "weighted_voter2"
 SAVE_PLOT_PATH = OUTPUT_DIR / "confusion_matrix_eval.png"
 SAVE_METRICS_CSV_PATH = OUTPUT_DIR / "metrics_table_eval.csv"
 
@@ -259,9 +269,10 @@ def run_weighted_boxes_fusion_on_image(models, image_path: Path):
     per_model_predictions = {model_name: [] for model_name, _, _ in models}
 
     for model_name, model, class_map in models:
+        model_conf_thresh = MODEL_CONF_THRESH.get(model_name, CONF_THRESH)
         results = model.predict(
             source=str(image_path),
-            conf=CONF_THRESH,
+            conf=model_conf_thresh,
             imgsz=IMGSZ,
             device=DEVICE,
             verbose=False,
@@ -471,11 +482,11 @@ def build_metrics_table_lines(per_class_metrics, macro_metrics):
         )
 
     lines.append("-" * len(header))
-    orange = "\033[38;5;214m"
+    red = "\033[38;2;255;42;0m"
     reset = "\033[0m"
     lines.append(
         f"{'macro-avg':<10}"
-        + orange
+        + red
         + f"{fmt_pct(macro_metrics['Precision']):>10}"
         + f"{fmt_pct(macro_metrics['Recall']):>10}"
         + f"{fmt_pct(macro_metrics['F1-score']):>10}"
@@ -575,7 +586,7 @@ def main():
         elapsed = time.time() - start_time
         minutes, seconds = divmod(int(elapsed), 60)
         print(
-            f"Progress: {idx}/{total_files} ({idx / total_files * 100:.2f}%) \033[38;5;214mElapsed: {minutes}:{seconds:02d}\033[0m",
+            f"Progress: {idx}/{total_files} ({idx / total_files * 100:.1f}%) Elapsed: {minutes}:{seconds:02d}",
             end="\r",
         )
     print()
@@ -604,14 +615,14 @@ def main():
     )
 
     print(f"\n{'=' * 70}")
-    print("Ensemble: Weighted Boxes Fusion")
+    print("Ensemble: Weighted Boxes Fusion (Top-3)")
     print(f"{'=' * 70}")
     per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
     print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics)
     print()
 
     if SAVE_PLOT:
-        plot_confusion(matrix, SAVE_PLOT_PATH, "Weighted Boxes Fusion")
+        plot_confusion(matrix, SAVE_PLOT_PATH, "Weighted Boxes Fusion (Top-3)")
         print(f"Saved confusion matrix plot to {SAVE_PLOT_PATH}")
 
         save_metrics_table_csv(

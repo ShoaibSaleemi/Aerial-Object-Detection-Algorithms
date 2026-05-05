@@ -31,7 +31,7 @@ from optuna.samplers import TPESampler
 
 # ── resolve paths ─────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-INFERENCE_PATH = PROJECT_ROOT / "scripts" / "model testing" / "inference_video_wbf_tracking.py"
+INFERENCE_PATH = PROJECT_ROOT / "scripts" / "model_testing" / "inference_video_wbf_tracking.py"
 if not INFERENCE_PATH.exists():
     raise FileNotFoundError(f"Inference script not found: {INFERENCE_PATH}")
 
