@@ -7,11 +7,13 @@ if __name__ == "__main__":
     # 1. Load a model
     # model = YOLO("yolov8n.yaml")  # build a new model from YAML (from scratch, not pretrained)
     # model = YOLO("yolov8n.yaml").load("yolo8n.pt")  # build from YAML and transfer weights
-    model = YOLO(str(PROJECT_ROOT / "yolo26n.pt"))  # load a pretrained model
+    model_file = PROJECT_ROOT / "yolo26n.pt"
+    model = YOLO(str(model_file))  # load a pretrained model
 
     # 2. Train the model, https://docs.ultralytics.com/modes/train/#musgd-optimizer
     results = model.train(
         data=str(PROJECT_ROOT / "data.yaml"),
+        name=model_file.stem,  # save to runs/detect/yolo26n (not train/train2/...)
         epochs=50, # pass over the entire dataset, affect training duration and model performance
         imgsz=640, # input image size is 1024, but resized to 640 for training
         batch=16,
