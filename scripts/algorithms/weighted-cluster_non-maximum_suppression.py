@@ -1,6 +1,7 @@
 import random
 import sys
 import time
+from itertools import zip_longest
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -303,12 +304,13 @@ def build_metrics_table_lines(per_class_metrics, macro_metrics):
 
 
 def print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics):
-    # Keep function name to avoid touching call sites; print sequential blocks instead.
-    for line in build_confusion_table_lines(matrix):
-        print(line)
-    print()
-    for line in build_metrics_table_lines(per_class_metrics, macro_metrics):
-        print(line)
+    left_lines = build_confusion_table_lines(matrix)
+    right_lines = build_metrics_table_lines(per_class_metrics, macro_metrics)
+
+    left_width = max(len(line) for line in left_lines)
+    gap = 4
+    for left, right in zip_longest(left_lines, right_lines, fillvalue=""):
+        print(f"{left:<{left_width}}{' ' * gap}{right}")
 
 
 def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_path):

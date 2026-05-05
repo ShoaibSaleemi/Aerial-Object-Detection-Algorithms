@@ -11,9 +11,9 @@ Features:
   - Inline progress output similar to tune_wbf_6.py
 
 Usage:
-    python "tools/tune_yolo_thresholds.py"
-    python "tools/tune_yolo_thresholds.py" --trials 100 --seed 42
-    python "tools/tune_yolo_thresholds.py" --model yolo9t --trials 30
+    python "tools/tune_yolo_f1.py"
+    python "tools/tune_yolo_f1.py" --trials 100 --seed 42
+    python "tools/tune_yolo_f1.py" --model yolo9t --trials 30
 """
 
 import argparse
@@ -32,7 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
 LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
 RUNS_DIR = PROJECT_ROOT / "runs" / "detect"
-OUTPUT_DIR = RUNS_DIR / "tune_yolo_thresholds"
+OUTPUT_DIR = RUNS_DIR / "tune_yolo_f1"
 AGGREGATE_BEST_JSON = OUTPUT_DIR / "best_yolo_thresholds.json"
 
 CLASS_NAMES = ["bird", "drone", "unknown"]
@@ -580,9 +580,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Bayesian optimization for per-model YOLO confidence threshold")
     parser.add_argument("--trials", type=int, default=50, help="Number of optimization trials per model")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--model", type=str, default=None, help="Only tune one model name (run folder name)")
-    parser.add_argument("--min-conf", type=float, default=0.40, help="Lower bound for confidence threshold")
-    parser.add_argument("--max-conf", type=float, default=0.80, help="Upper bound for confidence threshold")
+    parser.add_argument("--model", type=str, default="yolo9t", help="Only tune one model name (run folder name)")
+    parser.add_argument("--min-conf", type=float, default=0.55, help="Lower bound for confidence threshold")
+    parser.add_argument("--max-conf", type=float, default=0.75, help="Upper bound for confidence threshold")
     args = parser.parse_args()
 
     if args.trials <= 0:
