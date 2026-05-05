@@ -52,12 +52,18 @@ KNOWN_CONF_RANGE    = (0.30, 0.90)    # (min, max) float
 SCORE_MARGIN_RANGE  = (0.00, 1.00)    # (min, max) float
 DISAGREEMENT_RANGE  = (0.00, 1.00)    # (min, max) float
 MODEL_WEIGHT_RANGE  = (0.50, 2.00)    # (min, max) float, per-model per-class
+MODEL_CONF_RANGE    = (0.55, 0.75)    # (min, max) float, per-model confidence threshold
+
+# Low-confidence inference threshold for the one-time cache pass.
+# Must be <= MODEL_CONF_RANGE[0] so every candidate threshold can be applied.
+CONF_INFER = 0.001
 
 # ── Initial / baseline parameter values (sourced from weighted_boxes_fusion_6.py) ─
 INIT_MIN_SUPPORT   = wbf.MIN_MODEL_SUPPORT
 INIT_KNOWN_CONF    = wbf.KNOWN_FUSED_CONF_THRESH
 INIT_SCORE_MARGIN  = wbf.SCORE_MARGIN_THRESH
 INIT_DISAGREEMENT  = wbf.DISAGREEMENT_RATIO_THRESH
+INIT_MODEL_CONFS   = {name: wbf.MODEL_CONF_THRESH.get(name, wbf.CONF_THRESH) for name in [n for n, _ in wbf.MODELS]}
 
 # Model names in order (must match wbf.MODELS)
 MODEL_NAMES = [name for name, _ in wbf.MODELS]
@@ -84,19 +90,32 @@ def _finish_inline_status_line() -> None:
     _INLINE_STATUS_LEN = 0
 
 
+def _safe_best_trial(study_obj: optuna.Study):
+    """Return best trial or None when a study has no completed trials yet."""
+    try:
+        return study_obj.best_trial
+    except ValueError:
+        return None
+
+
 def _patch_globals(params: dict) -> None:
     """Patch module globals with trial parameters."""
     for key, val in params.items():
-        if not key.startswith("w_"):  # Skip individual weight keys
+        if not key.startswith("w_") and not key.startswith("conf_"):  # Skip weight/conf keys
             setattr(wbf, key, val)
-        
+
     # Set MODEL_WEIGHTS from per-class weights
     if "MODEL_WEIGHTS" in params:
         wbf.MODEL_WEIGHTS = params["MODEL_WEIGHTS"]
 
+    # Set MODEL_CONF_THRESH from per-model conf thresholds
+    if "MODEL_CONF_THRESH" in params:
+        wbf.MODEL_CONF_THRESH = params["MODEL_CONF_THRESH"]
+
 
 def _encode_params(min_support: int, known_conf: float, score_margin: float,
-                   disagreement: float, weights_list: list) -> dict:
+                   disagreement: float, weights_list: list,
+                   model_confs: dict | None = None) -> dict:
     """Convert optimization space parameters to trial parameters."""
     # weights_list is flattened: [w_model0_class0, w_model0_class1, ..., w_model5_class2]
     model_weights = {}
@@ -108,13 +127,20 @@ def _encode_params(min_support: int, known_conf: float, score_margin: float,
             "unknown": float(weights_list[idx + 2]),
         }
         idx += 3
-    
+
+    conf_thresh_map = {
+        name: float(model_confs[name]) if model_confs and name in model_confs
+        else INIT_MODEL_CONFS.get(name, wbf.CONF_THRESH)
+        for name in MODEL_NAMES
+    }
+
     return {
         "MIN_MODEL_SUPPORT": int(min_support),
         "KNOWN_FUSED_CONF_THRESH": float(known_conf),
         "SCORE_MARGIN_THRESH": float(score_margin),
         "DISAGREEMENT_RATIO_THRESH": float(disagreement),
         "MODEL_WEIGHTS": model_weights,
+        "MODEL_CONF_THRESH": conf_thresh_map,
     }
 
 
@@ -185,36 +211,176 @@ def load_models() -> list:
     return loaded
 
 
+def cache_ensemble_predictions(
+    loaded_models: list, image_paths: list, start_time: float
+) -> list[dict]:
+    """Run all ensemble models once per image at MODEL_CONF_THRESH and cache raw detections.
+
+    Returns one dict per image:
+        {
+            "raw_detections": [{box, class_id, confidence, model}, ...],
+            "per_model_raw":  {model_name: [{box, class_id, confidence}, ...], ...},
+        }
+    The cached data contains no weighted_scores — those depend on MODEL_WEIGHTS
+    and are recomputed cheaply per Optuna trial in compute_f1_from_cache().
+    """
+    total_files = len(image_paths)
+    cached = []
+
+    for idx, image_path in enumerate(image_paths, 1):
+        raw_detections: list[dict] = []
+        per_model_raw: dict[str, list] = {name: [] for name, _, _ in loaded_models}
+
+        for model_name, model, class_map in loaded_models:
+            results = model.predict(
+                source=str(image_path),
+                conf=CONF_INFER,
+                imgsz=wbf.IMGSZ,
+                device=wbf.DEVICE,
+                verbose=False,
+            )
+            result = results[0] if isinstance(results, list) else results
+
+            if not hasattr(result, "boxes") or len(result.boxes) == 0:
+                continue
+
+            for box, cls_id, conf in zip(
+                result.boxes.xyxy.cpu().numpy(),
+                result.boxes.cls.cpu().numpy().astype(int),
+                result.boxes.conf.cpu().numpy().astype(float),
+            ):
+                cls_name = class_map.get(int(cls_id), wbf.class_name_from_id(int(cls_id)))
+                cls_idx = 0 if cls_name == "bird" else 1 if cls_name == "drone" else 2
+                det = {
+                    "box": [float(v) for v in box.tolist()],
+                    "class_id": cls_idx,
+                    "confidence": float(conf),
+                    "model": model_name,
+                }
+                raw_detections.append(det)
+                per_model_raw[model_name].append({
+                    "box": det["box"],
+                    "class_id": cls_idx,
+                    "confidence": float(conf),
+                })
+
+        cached.append({"raw_detections": raw_detections, "per_model_raw": per_model_raw})
+
+        pct = idx / total_files * 100.0
+        elapsed = time.time() - start_time
+        t_hour, t_rem = divmod(int(elapsed), 3600)
+        t_min, t_sec = divmod(t_rem, 60)
+        _print_inline_status(
+            f"  Caching {idx}/{total_files} ({pct:.1f}%) | Elapsed: {t_hour}:{t_min:02d}:{t_sec:02d}"
+        )
+
+    _finish_inline_status_line()
+    return cached
+
+
+def compute_f1_from_cache(
+    cached_data: list[dict],
+    valid_label_paths: list,
+    model_weights_dict: dict,
+    model_conf_thresh: dict | None = None,
+) -> tuple[float, float, float, float]:
+    """Compute macro-averaged F1 from cached predictions — no GPU work.
+
+    For each image, filters cached detections by per-model confidence threshold,
+    recomputes weighted_score = model_weight * confidence using the trial's
+    model_weights_dict, then runs the CPU-only WBF fusion pipeline.
+    wbf globals (MIN_MODEL_SUPPORT, KNOWN_FUSED_CONF_THRESH, etc.) must be
+    patched by the caller before invoking this function.
+    """
+    fused_results = []
+    for entry in cached_data:
+        all_detections = []
+        for det in entry["raw_detections"]:
+            # Apply per-model confidence threshold filter
+            thresh = model_conf_thresh.get(det["model"], 0.0) if model_conf_thresh else 0.0
+            if det["confidence"] < thresh:
+                continue
+            cls_name = CLASS_NAMES[det["class_id"]]
+            model_weight = model_weights_dict.get(det["model"], {}).get(cls_name, 1.0)
+            all_detections.append({**det, "weighted_score": model_weight * det["confidence"]})
+
+        if not all_detections:
+            fused_results.append([])
+            continue
+
+        clusters = wbf.cluster_detections(all_detections, wbf.FUSION_IOU_THRESH)
+        fused = [
+            item
+            for cluster in clusters
+            for item in [wbf.fuse_cluster(cluster)]
+            if item is not None
+        ]
+        fused_results.append(fused)
+
+    matrix, _, _ = wbf.build_confusion_matrix(
+        fused_results, valid_label_paths, IMAGES_DIR, wbf.IOU_THRESH, verbose=False
+    )
+    _, macro_metrics, _ = wbf.compute_metrics_from_confusion(matrix)
+
+    precision_score = float(macro_metrics.get("Precision", np.nan))
+    recall_score = float(macro_metrics.get("Recall", np.nan))
+    f1_score = float(macro_metrics.get("F1-score", np.nan))
+
+    if np.isnan(precision_score):
+        precision_score = 0.0
+    if np.isnan(recall_score):
+        recall_score = 0.0
+    if np.isnan(f1_score):
+        f1_neg = 1.0
+        f1_score = 0.0
+    else:
+        f1_neg = float(-f1_score)
+
+    return f1_neg, precision_score, recall_score, f1_score
+
+
 def init_weights_from_baseline(loaded_models: list, image_paths: list,
-                               valid_label_paths: list) -> dict:
+                               valid_label_paths: list,
+                               cached_data: list[dict] | None = None) -> dict:
     """
     Run baseline (all weights = 1.0) and derive initial weights from per-class metrics.
     Weights are scaled by each model's F1 score on that class.
+    If cached_data is provided, uses the cached per_model_raw predictions instead
+    of running inference again (no GPU cost).
     """
     print("\n  Computing per-model per-class metrics for weight initialization...")
-    per_model_results = {model_name: [] for model_name, _, _ in loaded_models}
-    total_files = len(image_paths)
-    last_status_len = 0
-    start_time = time.time()
-    
-    for idx, image_path in enumerate(image_paths, 1):
-        _, per_model_preds = wbf.run_weighted_boxes_fusion_on_image(loaded_models, image_path)
-        for model_name in per_model_results:
-            per_model_results[model_name].append(per_model_preds[model_name])
 
-        # Update progress for every processed file on a single terminal line.
-        pct = (idx / total_files * 100.0) if total_files > 0 else 0.0
-        elapsed_total = time.time() - start_time
-        t_hour, t_rem = divmod(int(elapsed_total), 3600)
-        t_min, t_sec = divmod(t_rem, 60)
-        elapsed_str = f"{t_hour}:{t_min:02d}:{t_sec:02d}"
-        status = f"    {idx}/{total_files} ({pct:.1f}%) | Elapsed: {elapsed_str}"
-        padded = status.ljust(last_status_len)
-        print(f"\r{padded}", end="", flush=True)
-        last_status_len = len(status)
+    if cached_data is not None:
+        # Fast path: extract per-model predictions directly from the cache.
+        per_model_results = {model_name: [] for model_name, _, _ in loaded_models}
+        for entry in cached_data:
+            for model_name in per_model_results:
+                per_model_results[model_name].append(entry["per_model_raw"].get(model_name, []))
+        print("    Using cached predictions (no additional inference needed).")
+    else:
+        # Slow fallback: run GPU inference per image.
+        per_model_results = {model_name: [] for model_name, _, _ in loaded_models}
+        total_files = len(image_paths)
+        last_status_len = 0
+        start_time = time.time()
 
-    print()
-    print("    Baseline inference completed.")
+        for idx, image_path in enumerate(image_paths, 1):
+            _, per_model_preds = wbf.run_weighted_boxes_fusion_on_image(loaded_models, image_path)
+            for model_name in per_model_results:
+                per_model_results[model_name].append(per_model_preds[model_name])
+
+            pct = (idx / total_files * 100.0) if total_files > 0 else 0.0
+            elapsed_total = time.time() - start_time
+            t_hour, t_rem = divmod(int(elapsed_total), 3600)
+            t_min, t_sec = divmod(t_rem, 60)
+            elapsed_str = f"{t_hour}:{t_min:02d}:{t_sec:02d}"
+            status = f"    {idx}/{total_files} ({pct:.1f}%) | Elapsed: {elapsed_str}"
+            padded = status.ljust(last_status_len)
+            print(f"\r{padded}", end="", flush=True)
+            last_status_len = len(status)
+
+        print()
+        print("    Baseline inference completed.")
     
     # Compute per-model per-class metrics
     weights = {}
@@ -279,7 +445,7 @@ class OptimizationTracker:
 
 def main():
     parser = argparse.ArgumentParser(description="Bayesian optimization for weighted boxes fusion")
-    parser.add_argument("--trials", type=int, default=50, help="Number of optimization trials")
+    parser.add_argument("--trials", type=int, default=1000, help="Number of optimization trials")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
     
@@ -326,9 +492,15 @@ def main():
     print("\nLoading ensemble models...")
     loaded_models = load_models()
     
+    # Cache all ensemble model predictions once — GPU runs only here.
+    print("\nCaching ensemble predictions (one-time pass per model per image)...")
+    cache_start = time.time()
+    cached_data = cache_ensemble_predictions(loaded_models, image_paths, cache_start)
+    print(f"  Cache ready ({len(cached_data)} images). Subsequent trials use CPU-only fusion.")
+
     # Initialize weights from baseline
     print("\nBuilding optimization space...")
-    init_weights = init_weights_from_baseline(loaded_models, image_paths, valid_label_paths)
+    init_weights = init_weights_from_baseline(loaded_models, image_paths, valid_label_paths, cached_data=cached_data)
     
     # Build initial point with defaults
     init_params = {
@@ -337,26 +509,29 @@ def main():
         "score_margin": INIT_SCORE_MARGIN,
         "disagreement": INIT_DISAGREEMENT,
     }
-    
+
     # Add initial weights from baseline analysis
     for model_name in MODEL_NAMES:
         for class_name in CLASS_NAMES:
             init_params[f"w_{model_name}_{class_name}"] = init_weights[model_name][class_name]
+
+    # Add initial per-model confidence thresholds
+    for model_name in MODEL_NAMES:
+        init_params[f"conf_{model_name}"] = INIT_MODEL_CONFS.get(model_name, wbf.CONF_THRESH)
     
-    # Evaluate initial point
+    # Evaluate initial point (CPU-only using cache)
     opt_start_time = time.time()
     print("Evaluating initial point...")
     x0_weights = [init_weights[model_name][class_name] for model_name in MODEL_NAMES for class_name in CLASS_NAMES]
-    params_init = _encode_params(INIT_MIN_SUPPORT, INIT_KNOWN_CONF, INIT_SCORE_MARGIN, INIT_DISAGREEMENT, x0_weights)
+    x0_confs = {name: INIT_MODEL_CONFS.get(name, wbf.CONF_THRESH) for name in MODEL_NAMES}
+    params_init = _encode_params(INIT_MIN_SUPPORT, INIT_KNOWN_CONF, INIT_SCORE_MARGIN, INIT_DISAGREEMENT, x0_weights, x0_confs)
     _patch_globals(params_init)
-    y0_neg, y0_precision, y0_recall, y0_f1 = compute_f1_score(
-        loaded_models,
-        image_paths,
+    y0_neg, y0_precision, y0_recall, y0_f1 = compute_f1_from_cache(
+        cached_data,
         valid_label_paths,
-        label="Initial:",
-        start_time=opt_start_time,
+        params_init["MODEL_WEIGHTS"],
+        model_conf_thresh=params_init["MODEL_CONF_THRESH"],
     )
-    _finish_inline_status_line()
     print(f"  Initial Precision: {y0_precision:.4f}")
     print(f"  Initial Recall   : {y0_recall:.4f}")
     print(f"  Initial F1 score : {y0_f1:.4f}")
@@ -373,8 +548,9 @@ def main():
     try:
         study = optuna.load_study(study_name=study_name, storage=storage)
         print(f"\n  [RESUME] Found existing study with {len(study.trials)} completed trial(s).")
-        if study.best_trial is not None:
-            print(f"           Best F1 score so far: {-study.best_trial.value:.4f}")
+        _resume_best = _safe_best_trial(study)
+        if _resume_best is not None:
+            print(f"           Best F1 score so far: {-_resume_best.value:.4f}")
         start_trial = len(study.trials) + 1
     except KeyError:
         # Create new study with TPE sampler
@@ -391,9 +567,9 @@ def main():
     # Check if already completed
     if len(study.trials) >= args.trials:
         print(f"\n  All {args.trials} trials already completed. Delete {OPTUNA_DB} to restart.")
-        if study.best_trial is not None:
-            best_f1 = -study.best_trial.value
-            print(f"  Best F1 score: {best_f1:.4f}")
+        _done_best = _safe_best_trial(study)
+        if _done_best is not None:
+            print(f"  Best F1 score: {-_done_best.value:.4f}")
         return
     
     print(f"\nStarting optimization ({args.trials} trials, resuming from trial {start_trial})...\n")
@@ -402,8 +578,9 @@ def main():
     tracker = OptimizationTracker(sim_start_time)
 
     # Seed tracker with best score already in the study (so resume doesn't re-announce old bests)
-    if study.best_trial is not None:
-        prior_best_f1 = -study.best_trial.value
+    _prior_best = _safe_best_trial(study)
+    if _prior_best is not None:
+        prior_best_f1 = -_prior_best.value
         tracker.best_f1 = prior_best_f1
         prior_p, prior_r = 0.0, 0.0
         if BEST_JSON.exists():
@@ -417,10 +594,9 @@ def main():
 
     def save_best_json_snapshot(study_obj: optuna.Study) -> None:
         """Persist current best parameters so progress is visible on disk during runs."""
-        if study_obj.best_trial is None:
+        best_trial_obj = _safe_best_trial(study_obj)
+        if best_trial_obj is None:
             return
-
-        best_trial_obj = study_obj.best_trial
         best_f1_obj = -best_trial_obj.value
         best_params_obj = best_trial_obj.params
 
@@ -432,6 +608,11 @@ def main():
                     f"w_{model_name}_{class_name}",
                     1.0,
                 )
+
+        model_conf_thresh_obj = {
+            model_name: best_params_obj.get(f"conf_{model_name}", INIT_MODEL_CONFS.get(model_name, wbf.CONF_THRESH))
+            for model_name in MODEL_NAMES
+        }
 
         best_precision_obj = best_trial_obj.user_attrs.get("precision", 0.0)
         best_recall_obj = best_trial_obj.user_attrs.get("recall", 0.0)
@@ -446,6 +627,7 @@ def main():
                 "SCORE_MARGIN_THRESH": best_params_obj["score_margin"],
                 "DISAGREEMENT_RATIO_THRESH": best_params_obj["disagreement"],
                 "MODEL_WEIGHTS": model_weights_obj,
+                "MODEL_CONF_THRESH": model_conf_thresh_obj,
             },
         }
 
@@ -463,26 +645,30 @@ def main():
         known_conf  = trial.suggest_float("known_conf",   *KNOWN_CONF_RANGE)
         score_margin = trial.suggest_float("score_margin", *SCORE_MARGIN_RANGE)
         disagreement = trial.suggest_float("disagreement", *DISAGREEMENT_RANGE)
-        
+
         # Suggest weights for each model and class
         weights_list = []
         for model_name in MODEL_NAMES:
             for class_name in CLASS_NAMES:
                 w = trial.suggest_float(f"w_{model_name}_{class_name}", *MODEL_WEIGHT_RANGE)
                 weights_list.append(w)
-        
+
+        # Suggest per-model confidence thresholds
+        model_confs = {
+            model_name: trial.suggest_float(f"conf_{model_name}", *MODEL_CONF_RANGE)
+            for model_name in MODEL_NAMES
+        }
+
         # Encode and patch parameters
-        params = _encode_params(min_support, known_conf, score_margin, disagreement, weights_list)
+        params = _encode_params(min_support, known_conf, score_margin, disagreement, weights_list, model_confs)
         _patch_globals(params)
-        
-        # Compute F1 score (shows per-image progress inline)
-        trial_label = f"Trial {trial.number + 1}/{args.trials}:"
-        f1_neg, precision_score, recall_score, f1_score = compute_f1_score(
-            loaded_models,
-            image_paths,
+
+        # CPU-only: filter cached predictions by trial weights/thresholds
+        f1_neg, precision_score, recall_score, f1_score = compute_f1_from_cache(
+            cached_data,
             valid_label_paths,
-            label=trial_label,
-            start_time=sim_start_time,
+            params["MODEL_WEIGHTS"],
+            model_conf_thresh=params["MODEL_CONF_THRESH"],
         )
 
         # Update summary line after trial completes
@@ -507,26 +693,32 @@ def main():
     tracker.finalize()
     
     # ── Extract best result ───────────────────────────────────────────────────
-    best_trial = study.best_trial
+    best_trial = _safe_best_trial(study)
     if best_trial is None:
         raise RuntimeError("No trials completed.")
     
     best_f1 = -best_trial.value
     best_params_dict = best_trial.params
     
-    # Reconstruct MODEL_WEIGHTS from flat params
+    # Reconstruct MODEL_WEIGHTS and MODEL_CONF_THRESH from flat params
     model_weights = {}
     for model_name in MODEL_NAMES:
         model_weights[model_name] = {}
         for class_name in CLASS_NAMES:
             model_weights[model_name][class_name] = best_params_dict.get(f"w_{model_name}_{class_name}", 1.0)
-    
+
+    model_conf_thresh = {
+        model_name: best_params_dict.get(f"conf_{model_name}", INIT_MODEL_CONFS.get(model_name, wbf.CONF_THRESH))
+        for model_name in MODEL_NAMES
+    }
+
     best_params = {
         "MIN_MODEL_SUPPORT": best_params_dict["min_support"],
         "KNOWN_FUSED_CONF_THRESH": best_params_dict["known_conf"],
         "SCORE_MARGIN_THRESH": best_params_dict["score_margin"],
         "DISAGREEMENT_RATIO_THRESH": best_params_dict["disagreement"],
         "MODEL_WEIGHTS": model_weights,
+        "MODEL_CONF_THRESH": model_conf_thresh,
     }
     
     print(f"\n{'=' * 70}")
@@ -538,6 +730,9 @@ def main():
     print(f"    KNOWN_FUSED_CONF_THRESH     : {best_params['KNOWN_FUSED_CONF_THRESH']:.4f}")
     print(f"    SCORE_MARGIN_THRESH         : {best_params['SCORE_MARGIN_THRESH']:.4f}")
     print(f"    DISAGREEMENT_RATIO_THRESH   : {best_params['DISAGREEMENT_RATIO_THRESH']:.4f}")
+    print("\n  Per-model confidence thresholds:")
+    for model_name in MODEL_NAMES:
+        print(f"    {model_name}: {best_params['MODEL_CONF_THRESH'][model_name]:.4f}")
     print("\n  Per-model per-class weights:")
     for model_name in MODEL_NAMES:
         print(f"    {model_name}:")
