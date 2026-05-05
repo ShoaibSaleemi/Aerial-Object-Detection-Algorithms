@@ -25,7 +25,7 @@ LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
 IOU_THRESH = 0.5
 CONF_THRESH = 0.70
 MODEL_CONF_THRESH = {
-    "yolo9t": 0.70,
+    "yolo9t":  0.6724046133517759,
     "yolo11n": 0.712997868833143,
     "yolo26n": 0.6052508580184951
 }

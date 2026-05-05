@@ -11,9 +11,9 @@ Features:
   - Inline progress output similar to tune_wbf_6.py
 
 Usage:
-    python "tools/tune_yolo_thresholds.py"
-    python "tools/tune_yolo_thresholds.py" --trials 100 --seed 42
-    python "tools/tune_yolo_thresholds.py" --model yolo9t --trials 30
+    python "tools/tune_yolo_f1.py"
+    python "tools/tune_yolo_f1.py" --trials 100 --seed 42
+    python "tools/tune_yolo_f1.py" --model yolo9t --trials 30
 """
 
 import argparse
@@ -32,12 +32,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
 LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
 RUNS_DIR = PROJECT_ROOT / "runs" / "detect"
-OUTPUT_DIR = RUNS_DIR / "tune_yolo_thresholds"
+OUTPUT_DIR = RUNS_DIR / "tune_yolo_f1"
 AGGREGATE_BEST_JSON = OUTPUT_DIR / "best_yolo_thresholds.json"
 
 CLASS_NAMES = ["bird", "drone", "unknown"]
 IOU_THRESH = 0.5
 IMGSZ = 640
+
+# Run a single low-confidence inference pass and filter by threshold per trial,
+# so the GPU forward pass runs only once per image regardless of trial count.
+CONF_INFER = 0.001
 
 IMAGE_EXTENSIONS = [".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff"]
 
@@ -282,6 +286,102 @@ def discover_models(runs_dir: Path) -> list[tuple[str, Path]]:
     return models
 
 
+def cache_model_predictions(
+    model,
+    image_paths: list[Path],
+    valid_label_paths: list[Path],
+    start_time: float,
+) -> list[dict]:
+    """Run inference once at CONF_INFER on all images and cache raw predictions.
+
+    Each entry contains ground-truth boxes/labels and all predictions above
+    CONF_INFER with their confidence scores.  Subsequent Optuna trials simply
+    filter this cache by the candidate conf_thresh — no GPU work needed.
+    """
+    total_files = len(image_paths)
+    cached = []
+
+    for idx, (image_path, label_path) in enumerate(zip(image_paths, valid_label_paths), 1):
+        gt_boxes_xywh, gt_labels = load_label_file(label_path)
+        with Image.open(image_path) as img:
+            width, height = img.size
+        gt_boxes_xyxy = [xywhn_to_xyxy(b, width, height) for b in gt_boxes_xywh]
+
+        result = model.predict(
+            source=str(image_path),
+            conf=CONF_INFER,
+            imgsz=IMGSZ,
+            verbose=False,
+        )
+        result = result[0] if isinstance(result, list) else result
+
+        pred_entries: list[tuple[float, int, list[float]]] = []
+        if hasattr(result, "boxes") and len(result.boxes) > 0:
+            for box, conf, cls in zip(
+                result.boxes.xyxy.cpu().numpy(),
+                result.boxes.conf.cpu().numpy(),
+                result.boxes.cls.cpu().numpy(),
+            ):
+                cls_id = int(cls)
+                pred_entries.append((
+                    float(conf),
+                    cls_id if cls_id in (0, 1) else 2,
+                    list(box),
+                ))
+
+        cached.append({"gt_boxes": gt_boxes_xyxy, "gt_labels": gt_labels, "preds": pred_entries})
+
+        pct = idx / total_files * 100.0
+        elapsed = time.time() - start_time
+        t_hour, t_rem = divmod(int(elapsed), 3600)
+        t_min, t_sec = divmod(t_rem, 60)
+        _print_inline_status(
+            f"  Caching {idx}/{total_files} ({pct:.1f}%) | Elapsed: {t_hour}:{t_min:02d}:{t_sec:02d}"
+        )
+
+    _finish_inline_status_line()
+    return cached
+
+
+def compute_f1_from_cache(cached_data: list[dict], conf_thresh: float) -> tuple[float, float, float, float]:
+    """Compute macro-averaged F1 by filtering cached predictions at conf_thresh.
+
+    No GPU inference is performed — only numpy bookkeeping.
+    """
+    matrix = np.zeros((3, 3), dtype=int)
+
+    for entry in cached_data:
+        gt_boxes = entry["gt_boxes"]
+        gt_labels = entry["gt_labels"]
+        preds = [(conf, cls, box) for conf, cls, box in entry["preds"] if conf >= conf_thresh]
+        pred_boxes = [p[2] for p in preds]
+        pred_labels = [p[1] for p in preds]
+
+        assignments, _ = match_predictions(gt_boxes, pred_boxes, IOU_THRESH)
+
+        for gt_idx, gt_label in enumerate(gt_labels):
+            if gt_idx in assignments:
+                pred_label = pred_labels[assignments[gt_idx]]
+                matrix[pred_label, gt_label] += 1
+            else:
+                matrix[2, gt_label] += 1
+
+    _per_class, macro_metrics = compute_metrics_from_confusion(matrix)
+
+    precision = float(macro_metrics.get("Precision", np.nan))
+    recall = float(macro_metrics.get("Recall", np.nan))
+    f1 = float(macro_metrics.get("F1-score", np.nan))
+
+    if np.isnan(precision):
+        precision = 0.0
+    if np.isnan(recall):
+        recall = 0.0
+    if np.isnan(f1):
+        f1 = 0.0
+
+    return -f1, precision, recall, f1
+
+
 def compute_f1_score(
     model,
     image_paths: list[Path],
@@ -507,6 +607,10 @@ def tune_single_model(
         tracker.best_f1 = prior_best_f1
         print(f"  [RESUME] Seeding tracker with prior best F1: {prior_best_f1:.4f}")
 
+    print("  Caching inference results (one-time pass at conf=0.001)...")
+    cached_data = cache_model_predictions(model, image_paths, valid_label_paths, tracker.start_time)
+    print(f"  Cache ready ({len(cached_data)} images). Starting Optuna trials...\n")
+
     def on_trial_complete(study_obj: optuna.Study, _trial: optuna.trial.FrozenTrial) -> None:
         save_best_json_snapshot(study_obj, best_json_path, model_name, model_path, db_path, trials)
 
@@ -515,14 +619,12 @@ def tune_single_model(
         n_done = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE)
         trial_label = f"Trial {n_done + 1}/{trials}:"
 
-        f1_neg, precision_score, recall_score, f1_score = compute_f1_score(
-            model=model,
-            image_paths=image_paths,
-            valid_label_paths=valid_label_paths,
+        f1_neg, precision_score, recall_score, f1_score = compute_f1_from_cache(
+            cached_data=cached_data,
             conf_thresh=conf_thresh,
-            label=trial_label,
-            start_time=tracker.start_time,
         )
+        sys.stdout.write(f"  {trial_label} Conf: {conf_thresh:.4f}")
+        sys.stdout.flush()
         tracker.update(precision_score, recall_score, f1_score)
 
         trial.set_user_attr("precision", precision_score)
@@ -580,9 +682,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Bayesian optimization for per-model YOLO confidence threshold")
     parser.add_argument("--trials", type=int, default=50, help="Number of optimization trials per model")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--model", type=str, default=None, help="Only tune one model name (run folder name)")
-    parser.add_argument("--min-conf", type=float, default=0.40, help="Lower bound for confidence threshold")
-    parser.add_argument("--max-conf", type=float, default=0.80, help="Upper bound for confidence threshold")
+    parser.add_argument("--model", type=str, default="yolo8n", help="Only tune one model name (run folder name)")
+    parser.add_argument("--min-conf", type=float, default=0.55, help="Lower bound for confidence threshold")
+    parser.add_argument("--max-conf", type=float, default=0.75, help="Upper bound for confidence threshold")
     args = parser.parse_args()
 
     if args.trials <= 0:
