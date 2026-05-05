@@ -1,10 +1,12 @@
 """
-Random-search hyperparameter tuning for the WBF + Kalman tracking pipeline.
+Bayesian optimization hyperparameter tuning for the WBF + Kalman tracking pipeline.
 
-Loads ensemble models once, then for each trial patches the module-level
-globals in inference_video_wbf_tracking and runs the full evaluation loop
-across ALL validation sequences.  Scores are averaged over sequences.
-No output video is written during tuning.
+Loads ensemble models once, then uses Optuna's TPE sampler to tune:
+  - CONF_THRESH, FUSION_IOU_THRESH
+  - MIN_MODEL_SUPPORT, KNOWN_FUSED_CONF_THRESH, SCORE_MARGIN_THRESH, DISAGREEMENT_RATIO_THRESH
+  - MAX_LOST, MIN_HITS, IOU_THRESH_TRACK, SEQ_LEN
+  - Kalman noise parameters (R, Q_vel, P_vel)
+  - Per-model weights
 
 Optimises a composite score (averaged across validation sequences):
     score = 0.40 * AUC  +  0.30 * SR@IoU≥0.5  +  0.30 * Prec@20px
@@ -24,6 +26,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import optuna
+from optuna.samplers import TPESampler
 
 # ── resolve paths ─────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -43,11 +47,33 @@ VAL_VIDEOS_DIR = PROJECT_ROOT / "dataset" / "validation" / "videos"
 
 # Tuning output
 BEST_JSON  = PROJECT_ROOT / "runs" / "detect" / "tune_wbf" / "best_params.json"
+OPTUNA_DB  = PROJECT_ROOT / "runs" / "detect" / "tune_wbf" / "optuna_tracking_study.db"
 
 # Weights for composite objective (must sum to 1.0)
 W_AUC    = 0.40
 W_SR50   = 0.30
 W_PREC20 = 0.30
+
+_INLINE_STATUS_LEN = 0
+
+
+def _print_inline_status(status: str) -> None:
+    """Print status on one updating terminal line, clearing leftovers."""
+    global _INLINE_STATUS_LEN
+    if sys.stdout.isatty():
+        padded = status.ljust(_INLINE_STATUS_LEN)
+        print(f"\r{padded}", end="", flush=True)
+        _INLINE_STATUS_LEN = len(status)
+    else:
+        print(status, flush=True)
+
+
+def _finish_inline_status_line() -> None:
+    """Move cursor to the next line after inline updates."""
+    global _INLINE_STATUS_LEN
+    if sys.stdout.isatty():
+        print()
+    _INLINE_STATUS_LEN = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,7 +135,8 @@ def _make_kalman_init(r_noise: float, q_vel: float, p_vel: float):
 def evaluate(loaded_models: list, video_path: Path, gt_exist: list, gt_rect: list,
              lstm_device: torch.device, seq_idx: int | None = None,
              total_seq: int | None = None,
-             sim_start_time: float | None = None) -> dict:
+             sim_start_time: float | None = None,
+             label: str = "") -> dict:
     """Run the full pipeline on a single video and return evaluation metrics."""
 
     # Reset track ID counter so each trial starts fresh
@@ -130,7 +157,6 @@ def evaluate(loaded_models: list, video_path: Path, gt_exist: list, gt_rect: lis
     covered_frames: int = 0
     exist1_frames:  int = 0
     processed:      int = 0
-    last_status_len = 0
 
     while True:
         ok, frame = cap.read()
@@ -165,25 +191,23 @@ def evaluate(loaded_models: list, video_path: Path, gt_exist: list, gt_rect: lis
 
         processed += 1
         elapsed_total = (time.time() - sim_start_time) if sim_start_time is not None else 0.0
-        t_min, t_sec = divmod(int(elapsed_total), 60)
+        t_hour, t_rem = divmod(int(elapsed_total), 3600)
+        t_min, t_sec  = divmod(t_rem, 60)
+        elapsed_str   = f"{t_hour}:{t_min:02d}:{t_sec:02d}"
+        trial_prefix = f"{label} " if label else ""
         video_prefix = ""
         if seq_idx is not None and total_seq is not None:
             video_prefix = f"Video {seq_idx}/{total_seq} | "
         if total_frames > 0:
             pct = processed / total_frames * 100
             status = (
-                f"    {video_prefix}Frame: {processed}/{total_frames} ({pct:.1f}%)"
-                f" | Elapsed: {t_min}:{t_sec:02d}"
+                f"    {trial_prefix}{video_prefix}Frame: {processed}/{total_frames} ({pct:.1f}%)"
+                f" | Elapsed: {elapsed_str}"
             )
         else:
-            status = f"    {video_prefix}Frame: {processed} | Elapsed: {t_min}:{t_sec:02d}"
-        padded = status.ljust(last_status_len)
-        print(f"\r{padded}", end="", flush=True)
-        last_status_len = max(last_status_len, len(status))
+            status = f"    {trial_prefix}{video_prefix}Frame: {processed} | Elapsed: {elapsed_str}"
+        _print_inline_status(status)
 
-    if last_status_len > 0:
-        print("\r" + " " * last_status_len, end="")
-    print("\r", end="")
     cap.release()
 
     if exist1_frames == 0:
@@ -216,7 +240,8 @@ def evaluate(loaded_models: list, video_path: Path, gt_exist: list, gt_rect: lis
 def evaluate_all(loaded_models: list,
                  sequences: list[tuple[Path, list, list]],
                  lstm_device: torch.device,
-                 sim_start_time: float | None = None) -> dict:
+                 sim_start_time: float | None = None,
+                 trial_label: str = "") -> dict:
     """Evaluate across all sequences and return mean metrics."""
     keys = ("auc", "sr50", "prec20", "coverage", "score")
     totals = {k: 0.0 for k in keys}
@@ -234,8 +259,10 @@ def evaluate_all(loaded_models: list,
                 seq_idx=i,
                 total_seq=n_seq,
                 sim_start_time=sim_start_time,
+                label=trial_label,
             )
         except Exception as exc:
+            _finish_inline_status_line()
             print(f"  [WARN] Skipping sequence {i}: {exc}")
             continue
         for k in keys:
@@ -249,96 +276,88 @@ def evaluate_all(loaded_models: list,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Random search helpers
+# Optuna objective — called once per trial
 # ─────────────────────────────────────────────────────────────────────────────
-def _sample_params(rng: np.random.Generator, n_models: int) -> dict:
-    """Sample one random parameter set from the same ranges used before."""
-    w_yolo8n  = float(rng.uniform(0.5, 2.0))
-    w_yolo9t  = float(rng.uniform(0.5, 2.0))
-    w_yolo10n = float(rng.uniform(0.5, 2.0))
+def _run_trial(trial: optuna.Trial,
+               loaded_models: list,
+               sequences: list,
+               lstm_device: torch.device,
+               total_trials: int,
+               sim_start_time: float) -> float:
+    """Suggest parameters, evaluate, return negative composite score."""
+    conf_thresh      = trial.suggest_float("conf_thresh",      0.30, 0.85)
+    fusion_iou       = trial.suggest_float("fusion_iou",       0.25, 0.75)
+    min_support      = trial.suggest_int(  "min_support",      1,    6)
+    known_conf       = trial.suggest_float("known_conf",       0.20, 0.80)
+    score_margin     = trial.suggest_float("score_margin",     0.05, 0.60)
+    disagreement     = trial.suggest_float("disagreement",     0.20, 0.90)
+    max_lost         = trial.suggest_int(  "max_lost",         1,    30)
+    min_hits         = trial.suggest_int(  "min_hits",         1,    5)
+    iou_thresh_track = trial.suggest_float("iou_thresh_track", 0.10, 0.60)
+    seq_len          = trial.suggest_int(  "seq_len",          3,    20)
+    kalman_r         = trial.suggest_float("kalman_r",         0.5,  20.0)
+    kalman_q_vel     = trial.suggest_float("kalman_q_vel",     1e-4, 0.50, log=True)
+    kalman_p_vel     = trial.suggest_float("kalman_p_vel",     10.0, 5000.0, log=True)
+    w_yolo8n         = trial.suggest_float("w_yolo8n",         0.5,  2.0)
+    w_yolo9t         = trial.suggest_float("w_yolo9t",         0.5,  2.0)
+    w_yolo10n        = trial.suggest_float("w_yolo10n",        0.5,  2.0)
 
-    return {
-        "CONF_THRESH":               float(rng.uniform(0.30, 0.85)),
-        "FUSION_IOU_THRESH":         float(rng.uniform(0.25, 0.75)),
-        "MIN_MODEL_SUPPORT":         int(rng.integers(1, n_models + 1)),
-        "KNOWN_FUSED_CONF_THRESH":   float(rng.uniform(0.20, 0.80)),
-        "SCORE_MARGIN_THRESH":       float(rng.uniform(0.05, 0.60)),
-        "DISAGREEMENT_RATIO_THRESH": float(rng.uniform(0.20, 0.90)),
-        "MAX_LOST":                  int(rng.integers(1, 31)),
-        "MIN_HITS":                  int(rng.integers(1, 6)),
-        "IOU_THRESH_TRACK":          float(rng.uniform(0.10, 0.60)),
-        "SEQ_LEN":                   int(rng.integers(3, 21)),
-        "kalman_R":                  float(rng.uniform(0.5, 20.0)),
-        "kalman_Q_vel":              float(10 ** rng.uniform(np.log10(1e-4), np.log10(0.50))),
-        "kalman_P_vel":              float(10 ** rng.uniform(np.log10(10.0), np.log10(5000.0))),
-        "w_yolo8n":                  w_yolo8n,
-        "w_yolo9t":                  w_yolo9t,
-        "w_yolo10n":                 w_yolo10n,
-        "MODEL_WEIGHTS": {
-            "yolo8n":  {"bird": w_yolo8n,  "drone": w_yolo8n,  "unknown": w_yolo8n},
-            "yolo9t":  {"bird": w_yolo9t,  "drone": w_yolo9t,  "unknown": w_yolo9t},
-            "yolo10n": {"bird": w_yolo10n, "drone": w_yolo10n, "unknown": w_yolo10n},
-        },
+    model_weights = {
+        "yolo8n":  {"bird": w_yolo8n,  "drone": w_yolo8n,  "unknown": w_yolo8n},
+        "yolo9t":  {"bird": w_yolo9t,  "drone": w_yolo9t,  "unknown": w_yolo9t},
+        "yolo10n": {"bird": w_yolo10n, "drone": w_yolo10n, "unknown": w_yolo10n},
     }
 
-
-def _evaluate_params(loaded_models: list,
-                     sequences: list[tuple[Path, list, list]],
-                     lstm_device: torch.device,
-                     params: dict,
-                     trial_idx: int,
-                     total_trials: int,
-                     sim_start_time: float | None = None) -> dict:
-    print(f"\n[Trial {trial_idx}/{total_trials}]", flush=True)
-
     _patch_globals({
-        "CONF_THRESH":               params["CONF_THRESH"],
-        "FUSION_IOU_THRESH":         params["FUSION_IOU_THRESH"],
-        "MIN_MODEL_SUPPORT":         params["MIN_MODEL_SUPPORT"],
-        "KNOWN_FUSED_CONF_THRESH":   params["KNOWN_FUSED_CONF_THRESH"],
-        "SCORE_MARGIN_THRESH":       params["SCORE_MARGIN_THRESH"],
-        "DISAGREEMENT_RATIO_THRESH": params["DISAGREEMENT_RATIO_THRESH"],
-        "MAX_LOST":                  params["MAX_LOST"],
-        "MIN_HITS":                  params["MIN_HITS"],
-        "IOU_THRESH_TRACK":          params["IOU_THRESH_TRACK"],
-        "SEQ_LEN":                   params["SEQ_LEN"],
-        "MODEL_WEIGHTS":             params["MODEL_WEIGHTS"],
+        "CONF_THRESH":               conf_thresh,
+        "FUSION_IOU_THRESH":         fusion_iou,
+        "MIN_MODEL_SUPPORT":         min_support,
+        "KNOWN_FUSED_CONF_THRESH":   known_conf,
+        "SCORE_MARGIN_THRESH":       score_margin,
+        "DISAGREEMENT_RATIO_THRESH": disagreement,
+        "MAX_LOST":                  max_lost,
+        "MIN_HITS":                  min_hits,
+        "IOU_THRESH_TRACK":          iou_thresh_track,
+        "SEQ_LEN":                   seq_len,
+        "MODEL_WEIGHTS":             model_weights,
     })
+    inf.KalmanBoxTracker.__init__ = _make_kalman_init(kalman_r, kalman_q_vel, kalman_p_vel)
 
-    inf.KalmanBoxTracker.__init__ = _make_kalman_init(
-        params["kalman_R"],
-        params["kalman_Q_vel"],
-        params["kalman_P_vel"],
-    )
-
+    trial_label = f"Trial {trial.number + 1}/{total_trials}:"
     metrics = evaluate_all(
         loaded_models,
         sequences,
         lstm_device,
         sim_start_time=sim_start_time,
+        trial_label=trial_label,
     )
-    print(f"  Trial score: {metrics['score']:.4f}")
-    return metrics
+
+    trial.set_user_attr("auc",      metrics["auc"])
+    trial.set_user_attr("sr50",     metrics["sr50"])
+    trial.set_user_attr("prec20",   metrics["prec20"])
+    trial.set_user_attr("coverage", metrics["coverage"])
+
+    return -metrics["score"]  # minimise negative score
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Random-search tuning for WBF+Kalman tracker")
-    parser.add_argument("--trials", type=int, default=50, help="Number of random-search trials")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser = argparse.ArgumentParser(description="Bayesian optimization for WBF+Kalman tracker")
+    parser.add_argument("--trials", type=int, default=50, help="Number of optimization trials")
+    parser.add_argument("--seed",   type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
     if not VAL_VIDEOS_DIR.is_dir():
         raise FileNotFoundError(f"Validation videos dir not found: {VAL_VIDEOS_DIR}")
 
-    print("=" * 60)
-    print("  WBF + Kalman Tracking — Random Search Tuner")
-    print("=" * 60)
-    print(f"  Val dir: {VAL_VIDEOS_DIR}")
-    print(f"  Trials : {args.trials}")
-    print(f"  Seed   : {args.seed}")
+    print("=" * 70)
+    print("  WBF + Kalman Tracking — Bayesian Optimization Tuner (Optuna TPE)")
+    print("=" * 70)
+    print(f"  Val dir : {VAL_VIDEOS_DIR}")
+    print(f"  Trials  : {args.trials}")
+    print(f"  Seed    : {args.seed}")
     print()
 
     print("Discovering validation sequences...")
@@ -358,93 +377,150 @@ def main():
     print("\nLoading ensemble models...")
     loaded_models = load_models()
 
-    # LSTM / Kalman device
     lstm_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nUsing device: {lstm_device}")
 
-    rng = np.random.default_rng(args.seed)
+    # Keep Optuna logs quiet so progress output stays readable.
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    # Use previous defaults as trial 1, random for remaining trials
-    default_params = {
-        "CONF_THRESH":               0.70,
-        "FUSION_IOU_THRESH":         0.50,
-        "MIN_MODEL_SUPPORT":         3,
-        "KNOWN_FUSED_CONF_THRESH":   0.55,
-        "SCORE_MARGIN_THRESH":       0.20,
-        "DISAGREEMENT_RATIO_THRESH": 0.55,
-        "MAX_LOST":                  10,
-        "MIN_HITS":                  2,
-        "IOU_THRESH_TRACK":          0.30,
-        "SEQ_LEN":                   8,
-        "kalman_R":                  4.0,
-        "kalman_Q_vel":              0.01,
-        "kalman_P_vel":              1000.0,
-        "w_yolo8n":                  1.0,
-        "w_yolo9t":                  1.0,
-        "w_yolo10n":                 1.0,
-    }
-    default_params["MODEL_WEIGHTS"] = {
-        "yolo8n":  {"bird": 1.0, "drone": 1.0, "unknown": 1.0},
-        "yolo9t":  {"bird": 1.0, "drone": 1.0, "unknown": 1.0},
-        "yolo10n": {"bird": 1.0, "drone": 1.0, "unknown": 1.0},
-    }
-
-    print(f"\nStarting optimisation ({args.trials} trials)...\n")
-
-    best = None
-    history = []
-    sim_start_time = time.time()
-    for trial_idx in range(1, args.trials + 1):
-        params = default_params if trial_idx == 1 else _sample_params(rng, len(loaded_models))
-        metrics = _evaluate_params(
-            loaded_models=loaded_models,
-            sequences=sequences,
-            lstm_device=lstm_device,
-            params=params,
-            trial_idx=trial_idx,
-            total_trials=args.trials,
-            sim_start_time=sim_start_time,
+    # Create / resume SQLite-backed study.
+    OPTUNA_DB.parent.mkdir(parents=True, exist_ok=True)
+    storage    = optuna.storages.RDBStorage(f"sqlite:///{OPTUNA_DB}")
+    study_name = "wbf_tracking_bayesian_optimization"
+    try:
+        study = optuna.load_study(study_name=study_name, storage=storage)
+        print(f"\n  [RESUME] Found existing study with {len(study.trials)} completed trial(s).")
+        if study.best_trial is not None:
+            print(f"           Best score so far: {-study.best_trial.value:.4f}")
+        start_trial = len(study.trials) + 1
+    except KeyError:
+        sampler = TPESampler(seed=args.seed)
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage,
+            sampler=sampler,
+            direction="minimize",
         )
+        print("\n  [NEW] Starting fresh optimization study")
+        start_trial = 1
 
-        record = {
-            "trial": trial_idx,
-            "score": metrics["score"],
-            "metrics": {k: metrics[k] for k in ("auc", "sr50", "prec20", "coverage")},
-            "params": {k: v for k, v in params.items() if k != "MODEL_WEIGHTS"},
+    if len(study.trials) >= args.trials:
+        print(f"\n  All {args.trials} trials already completed. Delete {OPTUNA_DB} to restart.")
+        if study.best_trial is not None:
+            print(f"  Best score: {-study.best_trial.value:.4f}")
+        return
+
+    print(f"\nStarting optimization ({args.trials} trials, resuming from trial {start_trial})...\n")
+
+    red   = "\033[38;2;255;42;0m"
+    reset = "\033[0m"
+
+    sim_start_time = time.time()
+
+    # Seed best score so only genuinely new bests are flagged on resume.
+    prior_best_score = -study.best_trial.value if study.best_trial is not None else -float("inf")
+    if study.best_trial is not None:
+        print(f"  [RESUME] Prior best score: {prior_best_score:.4f}")
+
+    def save_best_json(study_obj: optuna.Study) -> None:
+        """Write only the best params to JSON (no history)."""
+        if study_obj.best_trial is None:
+            return
+        bt    = study_obj.best_trial
+        bp    = bt.params
+        score = -bt.value
+        model_weights = {
+            "yolo8n":  {"bird": bp["w_yolo8n"],  "drone": bp["w_yolo8n"],  "unknown": bp["w_yolo8n"]},
+            "yolo9t":  {"bird": bp["w_yolo9t"],  "drone": bp["w_yolo9t"],  "unknown": bp["w_yolo9t"]},
+            "yolo10n": {"bird": bp["w_yolo10n"], "drone": bp["w_yolo10n"], "unknown": bp["w_yolo10n"]},
         }
-        history.append(record)
+        output = {
+            "score":   score,
+            "metrics": {
+                "auc":      bt.user_attrs.get("auc",      0.0),
+                "sr50":     bt.user_attrs.get("sr50",     0.0),
+                "prec20":   bt.user_attrs.get("prec20",   0.0),
+                "coverage": bt.user_attrs.get("coverage", 0.0),
+            },
+            "params": {
+                "CONF_THRESH":               bp["conf_thresh"],
+                "FUSION_IOU_THRESH":         bp["fusion_iou"],
+                "MIN_MODEL_SUPPORT":         bp["min_support"],
+                "KNOWN_FUSED_CONF_THRESH":   bp["known_conf"],
+                "SCORE_MARGIN_THRESH":       bp["score_margin"],
+                "DISAGREEMENT_RATIO_THRESH": bp["disagreement"],
+                "MAX_LOST":                  bp["max_lost"],
+                "MIN_HITS":                  bp["min_hits"],
+                "IOU_THRESH_TRACK":          bp["iou_thresh_track"],
+                "SEQ_LEN":                   bp["seq_len"],
+                "kalman_R":                  bp["kalman_r"],
+                "kalman_Q_vel":              bp["kalman_q_vel"],
+                "kalman_P_vel":              bp["kalman_p_vel"],
+                "MODEL_WEIGHTS":             model_weights,
+            },
+        }
+        BEST_JSON.parent.mkdir(parents=True, exist_ok=True)
+        with open(BEST_JSON, "w") as f:
+            json.dump(output, f, indent=2)
 
-        if best is None or record["score"] > best["score"]:
-            best = record
-            print(f"  New best: {best['score']:.4f}")
+    def on_trial_complete(study_obj: optuna.Study, frozen: optuna.trial.FrozenTrial) -> None:
+        score   = -frozen.value
+        is_best = (
+            study_obj.best_trial is not None
+            and study_obj.best_trial.number == frozen.number
+            and score > prior_best_score
+        )
+        auc    = frozen.user_attrs.get("auc",    0.0)
+        sr50   = frozen.user_attrs.get("sr50",   0.0)
+        prec20 = frozen.user_attrs.get("prec20", 0.0)
+        if is_best:
+            suffix = (
+                f" | AUC: {auc:.4f} | SR@IoU>=0.5: {sr50:.4f}"
+                f" | Prec@20px: {prec20:.4f} | Score: {red}{score:.4f}{reset}"
+                f" | {red}New best ★{reset}"
+            )
+        else:
+            suffix = (
+                f" | AUC: {auc:.4f} | SR@IoU>=0.5: {sr50:.4f}"
+                f" | Prec@20px: {prec20:.4f} | Score: {score:.4f}"
+            )
+        sys.stdout.write(suffix + "\n")
+        sys.stdout.flush()
+        save_best_json(study_obj)
 
-    # ── Results ───────────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
+    def objective(trial: optuna.Trial) -> float:
+        return _run_trial(trial, loaded_models, sequences, lstm_device, args.trials, sim_start_time)
+
+    study.optimize(
+        objective,
+        n_trials=args.trials - len(study.trials),
+        show_progress_bar=False,
+        callbacks=[on_trial_complete],
+    )
+
+    # ── Final summary ──────────────────────────────────────────────────────
+    best_trial = study.best_trial
+    if best_trial is None:
+        raise RuntimeError("No trials completed.")
+
+    bp    = best_trial.params
+    score = -best_trial.value
+
+    print(f"\n{'=' * 70}")
     print("  Best trial")
-    print("=" * 60)
-    if best is None:
-        raise RuntimeError("No valid trial results.")
-
-    print(f"  Score    : {best['score']:.4f}")
-    print(f"  AUC      : {best['metrics']['auc']:.4f}")
-    print(f"  SR@IoU≥.5: {best['metrics']['sr50']:.4f}")
-    print(f"  Prec@20px: {best['metrics']['prec20']:.4f}")
-    print(f"  Coverage : {best['metrics']['coverage']:.4f}")
+    print(f"{'=' * 70}")
+    print(f"  Score      : {score:.4f}")
+    print(f"  AUC        : {best_trial.user_attrs.get('auc', 0.0):.4f}")
+    print(f"  SR@IoU>=0.5: {best_trial.user_attrs.get('sr50', 0.0):.4f}")
+    print(f"  Prec@20px  : {best_trial.user_attrs.get('prec20', 0.0):.4f}")
+    print(f"  Coverage   : {best_trial.user_attrs.get('coverage', 0.0):.4f}")
     print("\n  Parameters:")
-    for k, v in best["params"].items():
-        print(f"    {k:<32} {v}")
+    for k, v in bp.items():
+        print(f"    {k:<28} {v}")
 
-    # Save best params to JSON
-    BEST_JSON.parent.mkdir(parents=True, exist_ok=True)
-    output = {
-        "score":    best["score"],
-        "metrics":  best["metrics"],
-        "params":   best["params"],
-        "history":  history,
-    }
-    with open(BEST_JSON, "w") as f:
-        json.dump(output, f, indent=2)
+    save_best_json(study)
     print(f"\n  Best params saved → {BEST_JSON}")
+    print(f"  Optuna study saved → {OPTUNA_DB}")
 
 
 if __name__ == "__main__":

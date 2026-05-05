@@ -65,7 +65,7 @@ def convert_labels_for_images(
             elapsed = time.time() - start_time
             minutes, seconds = divmod(int(elapsed), 60)
             print(
-                f"Progress: {processed}/{total} ({processed / total * 100:.2f}%) "
+                f"Progress: {processed}/{total} ({processed / total * 100:.1f}%) "
                 f"Elapsed: {minutes}:{seconds:02d}",
                 end='\r',
             )

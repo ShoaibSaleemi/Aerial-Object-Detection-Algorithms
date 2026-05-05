@@ -22,7 +22,7 @@ for idx, file in enumerate(label_files, start=1):
         elapsed = time.time() - start_time
         minutes, seconds = divmod(int(elapsed), 60)
         print(
-            f"Progress: {idx}/{total_files} ({idx / total_files * 100:.2f}%) "
+            f"Progress: {idx}/{total_files} ({idx / total_files * 100:.1f}%) "
             f"Elapsed: {minutes}:{seconds:02d}",
             end="\r",
         )
