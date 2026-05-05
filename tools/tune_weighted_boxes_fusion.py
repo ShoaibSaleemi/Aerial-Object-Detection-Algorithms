@@ -46,6 +46,19 @@ LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
 BEST_JSON = PROJECT_ROOT / "runs" / "detect" / "tune_wbf" / "best_params_bayesian.json"
 OPTUNA_DB = PROJECT_ROOT / "runs" / "detect" / "tune_wbf" / "optuna_study.db"
 
+# ── Tuning search ranges ──────────────────────────────────────────────────────
+MIN_SUPPORT_RANGE   = (1, 6)          # (min, max) int
+KNOWN_CONF_RANGE    = (0.30, 0.90)    # (min, max) float
+SCORE_MARGIN_RANGE  = (0.00, 1.00)    # (min, max) float
+DISAGREEMENT_RANGE  = (0.00, 1.00)    # (min, max) float
+MODEL_WEIGHT_RANGE  = (0.50, 2.00)    # (min, max) float, per-model per-class
+
+# ── Initial / baseline parameter values (sourced from weighted_boxes_fusion.py) ─
+INIT_MIN_SUPPORT   = wbf.MIN_MODEL_SUPPORT
+INIT_KNOWN_CONF    = wbf.KNOWN_FUSED_CONF_THRESH
+INIT_SCORE_MARGIN  = wbf.SCORE_MARGIN_THRESH
+INIT_DISAGREEMENT  = wbf.DISAGREEMENT_RATIO_THRESH
+
 # Model names in order (must match wbf.MODELS)
 MODEL_NAMES = [name for name, _ in wbf.MODELS]
 CLASS_NAMES = wbf.CLASS_NAMES
@@ -319,10 +332,10 @@ def main():
     
     # Build initial point with defaults
     init_params = {
-        "min_support": 3,
-        "known_conf": 0.55,
-        "score_margin": 0.20,
-        "disagreement": 0.55,
+        "min_support": INIT_MIN_SUPPORT,
+        "known_conf":  INIT_KNOWN_CONF,
+        "score_margin": INIT_SCORE_MARGIN,
+        "disagreement": INIT_DISAGREEMENT,
     }
     
     # Add initial weights from baseline analysis
@@ -334,7 +347,7 @@ def main():
     opt_start_time = time.time()
     print("Evaluating initial point...")
     x0_weights = [init_weights[model_name][class_name] for model_name in MODEL_NAMES for class_name in CLASS_NAMES]
-    params_init = _encode_params(3, 0.55, 0.20, 0.55, x0_weights)
+    params_init = _encode_params(INIT_MIN_SUPPORT, INIT_KNOWN_CONF, INIT_SCORE_MARGIN, INIT_DISAGREEMENT, x0_weights)
     _patch_globals(params_init)
     y0_neg, y0_precision, y0_recall, y0_f1 = compute_f1_score(
         loaded_models,
@@ -446,16 +459,16 @@ def main():
     # Define objective function with closure
     def objective(trial: optuna.Trial) -> float:
         # Suggest parameters
-        min_support = trial.suggest_int("min_support", 1, 6)
-        known_conf = trial.suggest_float("known_conf", 0.3, 0.9)
-        score_margin = trial.suggest_float("score_margin", 0.0, 1.0)
-        disagreement = trial.suggest_float("disagreement", 0.0, 1.0)
+        min_support = trial.suggest_int(  "min_support", *MIN_SUPPORT_RANGE)
+        known_conf  = trial.suggest_float("known_conf",   *KNOWN_CONF_RANGE)
+        score_margin = trial.suggest_float("score_margin", *SCORE_MARGIN_RANGE)
+        disagreement = trial.suggest_float("disagreement", *DISAGREEMENT_RANGE)
         
         # Suggest weights for each model and class
         weights_list = []
         for model_name in MODEL_NAMES:
             for class_name in CLASS_NAMES:
-                w = trial.suggest_float(f"w_{model_name}_{class_name}", 0.5, 2.0)
+                w = trial.suggest_float(f"w_{model_name}_{class_name}", *MODEL_WEIGHT_RANGE)
                 weights_list.append(w)
         
         # Encode and patch parameters

@@ -1,4 +1,5 @@
 import csv
+import json
 from pathlib import Path
 import random
 import time
@@ -27,21 +28,31 @@ FUSION_IOU_THRESH = 0.50
 IMGSZ = 640
 DEVICE = ""  # "cpu", "0", "0,1"; empty lets Ultralytics auto-select.
 
-# Unknown-decision thresholds (applied after known-class weighted voting).
-MIN_MODEL_SUPPORT = 5
-KNOWN_FUSED_CONF_THRESH = 0.68770202403814
-SCORE_MARGIN_THRESH = 0.5582857958051067
-DISAGREEMENT_RATIO_THRESH = 0.15223066760019896
-
-# Per-model per-class weighting for weighted voting / box fusion.
-MODEL_WEIGHTS = {
-    "yolo8n":  {"bird": 1.0173818474125131,  "drone": 1.3684375247874139,  "unknown": 1.1646555286393707},
-    "yolo9t":  {"bird": 1.3345783180967155,  "drone": 1.3246461700191348,  "unknown": 1.4472517946232146},
-    "yolo10n": {"bird": 0.701091472694561,   "drone": 0.9099028240616815,  "unknown": 0.718502456356537},
-    "yolo11n": {"bird": 1.3215138210731259,  "drone": 1.9403016932408828,  "unknown": 1.338899849846067},
-    "yolo12n": {"bird": 0.8035608928262429,  "drone": 1.3438739986019623,  "unknown": 1.3166024543945136},
-    "yolo26n": {"bird": 1.3364625610235248,  "drone": 1.1804482074749882,  "unknown": 1.746577505269269},
+# Unknown-decision thresholds and model weights — loaded from tuner output if available.
+_BEST_PARAMS_JSON = PROJECT_ROOT / "runs" / "detect" / "tune_wbf" / "best_params_bayesian.json"
+_defaults = {
+    "MIN_MODEL_SUPPORT": 5,
+    "KNOWN_FUSED_CONF_THRESH": 0.68770202403814,
+    "SCORE_MARGIN_THRESH": 0.5582857958051067,
+    "DISAGREEMENT_RATIO_THRESH": 0.15223066760019896,
+    "MODEL_WEIGHTS": {
+        "yolo8n":  {"bird": 1.0173818474125131,  "drone": 1.3684375247874139,  "unknown": 1.1646555286393707},
+        "yolo9t":  {"bird": 1.3345783180967155,  "drone": 1.3246461700191348,  "unknown": 1.4472517946232146},
+        "yolo10n": {"bird": 0.701091472694561,   "drone": 0.9099028240616815,  "unknown": 0.718502456356537},
+        "yolo11n": {"bird": 1.3215138210731259,  "drone": 1.9403016932408828,  "unknown": 1.338899849846067},
+        "yolo12n": {"bird": 0.8035608928262429,  "drone": 1.3438739986019623,  "unknown": 1.3166024543945136},
+        "yolo26n": {"bird": 1.3364625610235248,  "drone": 1.1804482074749882,  "unknown": 1.746577505269269},
+    },
 }
+if _BEST_PARAMS_JSON.exists():
+    _loaded = json.loads(_BEST_PARAMS_JSON.read_text()).get("params", {})
+    _defaults.update({k: v for k, v in _loaded.items() if k in _defaults})
+
+MIN_MODEL_SUPPORT          = _defaults["MIN_MODEL_SUPPORT"]
+KNOWN_FUSED_CONF_THRESH    = _defaults["KNOWN_FUSED_CONF_THRESH"]
+SCORE_MARGIN_THRESH        = _defaults["SCORE_MARGIN_THRESH"]
+DISAGREEMENT_RATIO_THRESH  = _defaults["DISAGREEMENT_RATIO_THRESH"]
+MODEL_WEIGHTS              = _defaults["MODEL_WEIGHTS"]
 
 # Ensemble model list: (name, path_to_weights)
 MODELS = [
@@ -471,11 +482,11 @@ def build_metrics_table_lines(per_class_metrics, macro_metrics):
         )
 
     lines.append("-" * len(header))
-    orange = "\033[38;5;214m"
+    red = "\033[38;2;255;42;0m"
     reset = "\033[0m"
     lines.append(
         f"{'macro-avg':<10}"
-        + orange
+        + red
         + f"{fmt_pct(macro_metrics['Precision']):>10}"
         + f"{fmt_pct(macro_metrics['Recall']):>10}"
         + f"{fmt_pct(macro_metrics['F1-score']):>10}"
@@ -575,7 +586,7 @@ def main():
         elapsed = time.time() - start_time
         minutes, seconds = divmod(int(elapsed), 60)
         print(
-            f"Progress: {idx}/{total_files} ({idx / total_files * 100:.2f}%) \033[38;5;214mElapsed: {minutes}:{seconds:02d}\033[0m",
+            f"Progress: {idx}/{total_files} ({idx / total_files * 100:.1f}%) Elapsed: {minutes}:{seconds:02d}",
             end="\r",
         )
     print()
