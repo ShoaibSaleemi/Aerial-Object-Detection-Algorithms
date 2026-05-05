@@ -29,18 +29,18 @@ DEVICE = ""  # "cpu", "0", "0,1"; empty lets Ultralytics auto-select.
 
 # Unknown-decision thresholds (applied after known-class weighted voting).
 MIN_MODEL_SUPPORT = 5
-KNOWN_FUSED_CONF_THRESH = 0.5601453198085411
-SCORE_MARGIN_THRESH = 0.09125076880326494
-DISAGREEMENT_RATIO_THRESH = 0.15533651974598006
+KNOWN_FUSED_CONF_THRESH = 0.68770202403814
+SCORE_MARGIN_THRESH = 0.5582857958051067
+DISAGREEMENT_RATIO_THRESH = 0.15223066760019896
 
 # Per-model per-class weighting for weighted voting / box fusion.
 MODEL_WEIGHTS = {
-    "yolo8n":  {"bird": 1.0814851758318496,  "drone": 1.1806397062045533,  "unknown": 1.5854956737557213},
-    "yolo9t":  {"bird": 1.1648048860139104,  "drone": 1.9507533272268047,  "unknown": 1.5176441781892689},
-    "yolo10n": {"bird": 1.012484828994974,   "drone": 1.238554113695587,   "unknown": 0.9796306541223246},
-    "yolo11n": {"bird": 1.2533830034169342,  "drone": 1.1708816661545447,  "unknown": 0.9072305499609367},
-    "yolo12n": {"bird": 1.2217564703689683,  "drone": 1.703242413959964,   "unknown": 1.5846263992743486},
-    "yolo26n": {"bird": 0.7438992484903112,  "drone": 1.0219630042404741,  "unknown": 1.585134798429956},
+    "yolo8n":  {"bird": 1.0173818474125131,  "drone": 1.3684375247874139,  "unknown": 1.1646555286393707},
+    "yolo9t":  {"bird": 1.3345783180967155,  "drone": 1.3246461700191348,  "unknown": 1.4472517946232146},
+    "yolo10n": {"bird": 0.701091472694561,   "drone": 0.9099028240616815,  "unknown": 0.718502456356537},
+    "yolo11n": {"bird": 1.3215138210731259,  "drone": 1.9403016932408828,  "unknown": 1.338899849846067},
+    "yolo12n": {"bird": 0.8035608928262429,  "drone": 1.3438739986019623,  "unknown": 1.3166024543945136},
+    "yolo26n": {"bird": 1.3364625610235248,  "drone": 1.1804482074749882,  "unknown": 1.746577505269269},
 }
 
 # Ensemble model list: (name, path_to_weights)
