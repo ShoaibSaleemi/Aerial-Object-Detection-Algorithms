@@ -357,7 +357,7 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=str,
-        default=None,
+        default="fasterrcnn_epoch_50",
         help="Evaluate a single checkpoint stem (example: best or fasterrcnn_epoch_50). Omit to evaluate all *.pt files.",
     )
     parser.add_argument(

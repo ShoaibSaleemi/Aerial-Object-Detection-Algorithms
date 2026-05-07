@@ -37,9 +37,9 @@ CONFIG = {
     "device": "auto",  # "cpu", "cuda", or "auto"
 }
 
-TICK_LABEL_FONTSIZE = 16
-AXIS_LABEL_FONTSIZE = 16
-CELL_VALUE_FONTSIZE = 25
+TICK_LABEL_FONTSIZE = 22
+AXIS_LABEL_FONTSIZE = 22
+CELL_VALUE_FONTSIZE = 33
 
 
 def build_cache_file_path(run_dir: Path, conf_thresh: float, iou_thresh: float) -> Path:
