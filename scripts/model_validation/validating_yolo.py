@@ -35,14 +35,34 @@ MODEL_CONF_THRESH = {
     "yolo12n": 0.6838702654977842,
     "yolo26n": 0.6052508580184951,
 }
+
+# --- Model selection ---------------------------------------------------------
+# Set a model to True to include it in evaluation, False to skip it.
+# Set RUN_ALL_MODELS = True to override and run every model regardless.
+RUN_ALL_MODELS = True
+ENABLED_MODELS = {
+    "yolo8n":  True,
+    "yolo8m":  True,
+    "yolo9t":  True,
+    "yolo10n": True,
+    "yolo11n": True,
+    "yolo12n": True,
+    "yolo26n": True,
+}
+# -----------------------------------------------------------------------------
+
 IMGSZ = 640
 
-TICK_LABEL_FONTSIZE = 16
-AXIS_LABEL_FONTSIZE = 16
-CELL_VALUE_FONTSIZE = 25 # Font size for the numbers inside the confusion matrix cells.
+TICK_LABEL_FONTSIZE = 22
+AXIS_LABEL_FONTSIZE = 22
+CELL_VALUE_FONTSIZE = 33 # Font size for the numbers inside the confusion matrix cells.
+PREDICTED_LABEL_PAD = -14   # Distance (points) between "Predicted" label and the matrix; decrease to move closer.
 
 SAVE_PLOT = True
 VERBOSE = False  # Print per-image matching/debug details during evaluation when True.
+
+# Folder where evaluation outputs (confusion matrix PNGs, CSV) are saved.
+EVAL_OUTPUT_DIR = PROJECT_ROOT / "runs" / "eval_yolo"
 
 
 def build_cache_file_path(detect_run_dir: Path, conf_thresh: float, iou_thresh: float, imgsz: int) -> Path:
@@ -286,7 +306,7 @@ def plot_confusion(matrix, save_path, title_prefix):
     ax.set_xticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
     ax.set_yticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
     ax.set_xlabel("Ground Truth", fontsize=AXIS_LABEL_FONTSIZE)
-    ax.set_ylabel("Predicted", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("Predicted", fontsize=AXIS_LABEL_FONTSIZE, labelpad=PREDICTED_LABEL_PAD)
 
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
@@ -446,27 +466,18 @@ def main():
         raise ValueError(f"No folders found in {detect_root_dir}")
 
     if len(sys.argv) > 1:
-        run_name = sys.argv[1]
-        if run_name not in available_runs:
+        run_names = [sys.argv[1]]
+        if run_names[0] not in available_runs:
             available_text = ", ".join(available_runs)
             raise ValueError(
-                f"Unknown folder '{run_name}'. Choose one from runs/detect: {available_text}"
+                f"Unknown folder '{run_names[0]}'. Choose one from runs/detect: {available_text}"
             )
+    elif RUN_ALL_MODELS:
+        run_names = available_runs
     else:
-        run_name = questionary.select(
-            "Choose a folder from runs/detect:",
-            choices=available_runs,
-        ).ask()
-        if not run_name:
-            raise ValueError("No folder selected from runs/detect")
-
-    detect_run_dir = detect_root_dir / run_name
-    run_display_name = format_run_display_name(run_name)
-    conf_thresh = MODEL_CONF_THRESH.get(run_name, CONF_THRESH)
-    cache_path = build_cache_file_path(detect_run_dir, conf_thresh, IOU_THRESH, IMGSZ)
-    model_path = str(detect_run_dir / "weights" / "best.pt")
-    save_plot_path = str(detect_run_dir / "confusion_matrix_eval.png")
-    save_metrics_csv_path = str(detect_run_dir / "metrics_table_eval.csv")
+        run_names = [name for name in available_runs if ENABLED_MODELS.get(name, False)]
+        if not run_names:
+            raise ValueError("No models enabled. Set RUN_ALL_MODELS=True or enable at least one in ENABLED_MODELS.")
 
     label_dir = LABELS_DIR
     if not label_dir.exists():
@@ -476,7 +487,7 @@ def main():
     if len(label_paths) == 0:
         raise ValueError(f"No label files found in {label_dir}")
 
-    model = YOLO(model_path)
+    # Pre-build image/label pairs (shared across all runs)
     image_paths = []
     valid_label_paths = []
     for label_path in sorted(label_paths):
@@ -495,73 +506,91 @@ def main():
     if len(image_paths) == 0:
         raise ValueError(f"No validation images found in {IMAGES_DIR}")
 
-    cached = load_eval_cache(cache_path)
-    if cached is not None:
-        print(f"Using cached evaluation for {run_name} (conf={conf_thresh:.4f})")
-        matrix = cached["matrix"]
-        total_known = cached["total_known"]
-        total_unknown = cached["total_unknown"]
-        per_class_metrics = cached["per_class_metrics"]
-        macro_metrics = cached["macro_metrics"]
-        summary_metrics = cached["summary_metrics"]
-    else:
-        print(f"Running inference on {len(image_paths)} validation images (conf={conf_thresh:.4f})...")
-        # Inference with progress bar
-        total_files = len(image_paths)
-        processed = 0
-        start_time = time.time()
-        results = []
-        for img_path in image_paths:
-            result = model.predict(
-                source=img_path,
-                conf=conf_thresh,
-                imgsz=IMGSZ,
-                verbose=False,
+    for run_name in run_names:
+        detect_run_dir = detect_root_dir / run_name
+        model_pt = detect_run_dir / "weights" / "best.pt"
+        if not model_pt.exists():
+            print(f"[SKIP] {run_name}: no weights/best.pt found")
+            continue
+
+        print(f"\n{'=' * 60}")
+        print(f"  Model: {run_name}")
+        print(f"{'=' * 60}")
+
+        run_display_name = format_run_display_name(run_name)
+        conf_thresh = MODEL_CONF_THRESH.get(run_name, CONF_THRESH)
+        cache_path = build_cache_file_path(detect_run_dir, conf_thresh, IOU_THRESH, IMGSZ)
+        save_plot_path = str(EVAL_OUTPUT_DIR / f"{run_name}.png")
+        save_metrics_csv_path = str(EVAL_OUTPUT_DIR / f"{run_name}_metrics.csv")
+        EVAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+        cached = load_eval_cache(cache_path)
+        if cached is not None:
+            print(f"Using cached evaluation for {run_name} (conf={conf_thresh:.4f})")
+            matrix = cached["matrix"]
+            total_known = cached["total_known"]
+            total_unknown = cached["total_unknown"]
+            per_class_metrics = cached["per_class_metrics"]
+            macro_metrics = cached["macro_metrics"]
+            summary_metrics = cached["summary_metrics"]
+        else:
+            print(f"Running inference on {len(image_paths)} validation images (conf={conf_thresh:.4f})...")
+            model = YOLO(str(model_pt))
+            total_files = len(image_paths)
+            processed = 0
+            start_time = time.time()
+            results = []
+            for img_path in image_paths:
+                result = model.predict(
+                    source=img_path,
+                    conf=conf_thresh,
+                    imgsz=IMGSZ,
+                    verbose=False,
+                )
+                results.append(result[0] if isinstance(result, list) else result)
+                processed += 1
+                elapsed = time.time() - start_time
+                minutes, seconds = divmod(int(elapsed), 60)
+                print(f"Progress: {processed}/{total_files} ({processed / total_files * 100:.2f}%) Elapsed: {minutes}:{seconds:02d}", end='\r')
+            print()
+
+            matrix, total_known, total_unknown = build_confusion_matrix(
+                results,
+                valid_label_paths,
+                IMAGES_DIR,
+                IOU_THRESH,
+                VERBOSE,
             )
-            results.append(result[0] if isinstance(result, list) else result)
-            processed += 1
-            elapsed = time.time() - start_time
-            minutes, seconds = divmod(int(elapsed), 60)
-            print(f"Progress: {processed}/{total_files} ({processed / total_files * 100:.2f}%) Elapsed: {minutes}:{seconds:02d}", end='\r')
-        print()  # Newline after progress bar
+            per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
 
-        matrix, total_known, total_unknown = build_confusion_matrix(
-            results,
-            valid_label_paths,
-            IMAGES_DIR,
-            IOU_THRESH,
-            VERBOSE,
-        )
-        per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
+            save_eval_cache(
+                cache_path=cache_path,
+                run_name=run_name,
+                conf_thresh=conf_thresh,
+                iou_thresh=IOU_THRESH,
+                imgsz=IMGSZ,
+                matrix=matrix,
+                per_class_metrics=per_class_metrics,
+                macro_metrics=macro_metrics,
+                summary_metrics=summary_metrics,
+                total_known=total_known,
+                total_unknown=total_unknown,
+            )
+            print(f"Saved evaluation cache: {cache_path}")
 
-        save_eval_cache(
-            cache_path=cache_path,
-            run_name=run_name,
-            conf_thresh=conf_thresh,
-            iou_thresh=IOU_THRESH,
-            imgsz=IMGSZ,
-            matrix=matrix,
-            per_class_metrics=per_class_metrics,
-            macro_metrics=macro_metrics,
-            summary_metrics=summary_metrics,
-            total_known=total_known,
-            total_unknown=total_unknown,
-        )
-        print(f"Saved evaluation cache: {cache_path}")
+        print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics)
+        print()
 
-    print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics)
-    print()
+        if SAVE_PLOT:
+            plot_confusion(matrix, save_plot_path, run_display_name)
+            print(f"Saved confusion matrix plot to {save_plot_path}")
 
-    if SAVE_PLOT:
-        plot_confusion(matrix, save_plot_path, run_display_name)
-        print(f"Saved confusion matrix plot to {save_plot_path}")
-
-        save_metrics_table_csv(
-            per_class_metrics=per_class_metrics,
-            macro_metrics=macro_metrics,
-            save_path=save_metrics_csv_path,
-        )
-        print(f"Saved metrics table CSV to {save_metrics_csv_path}")
+            save_metrics_table_csv(
+                per_class_metrics=per_class_metrics,
+                macro_metrics=macro_metrics,
+                save_path=save_metrics_csv_path,
+            )
+            print(f"Saved metrics table CSV to {save_metrics_csv_path}")
 
 
 if __name__ == "__main__":
