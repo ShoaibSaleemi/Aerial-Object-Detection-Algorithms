@@ -37,9 +37,9 @@ MODEL_CONF_THRESH = {
 }
 IMGSZ = 640
 
-TICK_LABEL_FONTSIZE = 14
+TICK_LABEL_FONTSIZE = 16
 AXIS_LABEL_FONTSIZE = 16
-CELL_VALUE_FONTSIZE = 20
+CELL_VALUE_FONTSIZE = 25 # Font size for the numbers inside the confusion matrix cells.
 
 SAVE_PLOT = True
 VERBOSE = False  # Print per-image matching/debug details during evaluation when True.
@@ -301,14 +301,6 @@ def plot_confusion(matrix, save_path, title_prefix):
                 fontsize=CELL_VALUE_FONTSIZE,
             )
 
-    cbar = fig.colorbar(im, ax=ax)
-    cbar_pos = cbar.ax.get_position()
-    cbar.ax.set_position([
-        cbar_pos.x0,
-        cbar_pos.y0 - 0.2,
-        cbar_pos.width,
-        cbar_pos.height,
-    ])
     fig.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -505,10 +497,7 @@ def main():
 
     cached = load_eval_cache(cache_path)
     if cached is not None:
-        print(
-            f"Using cached evaluation for {run_name} "
-            f"(conf={conf_thresh:.4f}, iou={IOU_THRESH:.2f}, imgsz={IMGSZ})"
-        )
+        print(f"Using cached evaluation for {run_name} (conf={conf_thresh:.4f})")
         matrix = cached["matrix"]
         total_known = cached["total_known"]
         total_unknown = cached["total_unknown"]
