@@ -29,7 +29,7 @@ CONFIG = {
     "images": str(PROJECT_ROOT / "dataset" / "validation" / "images"),
     "labels": str(PROJECT_ROOT / "dataset" / "validation" / "labels"),
     "iou_thresh": 0.5,
-    "conf_thresh": 0.95,
+    "conf_thresh": 0.996286,
     "save_plot": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "confusion_matrix_val.png"),
     "save_metrics_plot": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "metrics_table_val.png"),
     "save_plot_enabled": True,
@@ -464,44 +464,25 @@ def print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_me
 
 def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_path, title_prefix):
     rows = []
-    columns = [
-        "Class", "TP", "FP", "FN", "TN",
-        "Precision", "Recall", "F1-score", "Pfa", "P(success)"
-    ]
+    columns = ["Class", "Precision", "Recall", "F1-score"]
 
     for m in per_class_metrics:
         rows.append([
             m["class"],
-            m["TP"],
-            m["FP"],
-            m["FN"],
-            m["TN"],
             fmt_pct(m["Precision"]),
             fmt_pct(m["Recall"]),
             fmt_pct(m["F1-score"]),
-            fmt_pct(m["False Positive Rate"]),
-            fmt_pct(m["Detection Probability"]),
         ])
 
     rows.append([
         "macro-avg",
-        "-", "-", "-", "-",
         fmt_pct(macro_metrics["Precision"]),
         fmt_pct(macro_metrics["Recall"]),
         fmt_pct(macro_metrics["F1-score"]),
-        fmt_pct(macro_metrics["False Positive Rate"]),
-        fmt_pct(macro_metrics["Detection Probability"]),
-    ])
-
-    rows.append([
-        "open-set",
-        "-", "-", "-", "-", "-", "-", "-",
-        fmt_pct(summary_metrics["Unknown false alarm rate"]),
-        fmt_pct(1.0 - summary_metrics["Known miss rate"]) if not np.isnan(summary_metrics["Known miss rate"]) else "nan",
     ])
 
     fig_h = 2.6 + 0.5 * len(rows)
-    fig, ax = plt.subplots(figsize=(13, fig_h))
+    fig, ax = plt.subplots(figsize=(7, fig_h))
     ax.axis("off")
     ax.set_title(f"{title_prefix} Evaluation Metrics Table", fontsize=14, pad=12)
 
@@ -515,18 +496,8 @@ def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_p
     table.set_fontsize(10)
     table.scale(1, 1.5)
 
-    footer_text = (
-        f"Known objects: {summary_metrics['Known objects']}    "
-        f"Unknown objects: {summary_metrics['Unknown objects']}    "
-        f"Known miss rate: {fmt_pct(summary_metrics['Known miss rate'])}    "
-        f"Unknown false alarm rate: {fmt_pct(summary_metrics['Unknown false alarm rate'])}    "
-        f"Unknown correct rejections: {summary_metrics['Unknown correct rejections']}"
-    )
-    fig.text(0.5, 0.03, footer_text, ha="center", fontsize=10)
-
     save_path = Path(save_path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout(rect=[0.02, 0.08, 0.98, 0.98])
+    fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.98])
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 

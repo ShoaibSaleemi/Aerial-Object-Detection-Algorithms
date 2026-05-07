@@ -40,9 +40,9 @@ IOU_THRESH = 0.5
 # Single inference pass at this conf — captures all predictions for the sweep.
 CONF_INFER = 0.001
 
-CONF_MIN = 0.7
-CONF_MAX = 0.95
-N_STEPS = 200
+CONF_MIN = 0.55
+CONF_MAX = 1.00
+N_STEPS = 1000
 
 IMAGE_EXTENSIONS = [".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff"]
 
