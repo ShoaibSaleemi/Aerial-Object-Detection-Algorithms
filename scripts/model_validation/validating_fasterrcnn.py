@@ -29,7 +29,7 @@ CONFIG = {
     "images": str(PROJECT_ROOT / "dataset" / "validation" / "images"),
     "labels": str(PROJECT_ROOT / "dataset" / "validation" / "labels"),
     "iou_thresh": 0.5,
-    "conf_thresh": 0.85,
+    "conf_thresh": 0.95,
     "save_plot": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "confusion_matrix_val.png"),
     "save_metrics_plot": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "metrics_table_val.png"),
     "save_plot_enabled": True,
