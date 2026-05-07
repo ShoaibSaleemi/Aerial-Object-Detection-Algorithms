@@ -489,6 +489,8 @@ def main():
     print(f"  Val dir : {VAL_VIDEOS_DIR}")
     print(f"  Trials  : {args.trials}")
     print(f"  Seed    : {args.seed}")
+    print(f"  JSON out: {BEST_JSON}")
+    print(f"  DB out  : {OPTUNA_DB}")
     print()
 
     print("Discovering validation sequences...")

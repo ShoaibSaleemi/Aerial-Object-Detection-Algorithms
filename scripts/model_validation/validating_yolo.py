@@ -1,4 +1,5 @@
 import csv
+import json
 from pathlib import Path
 import sys
 from itertools import zip_longest
@@ -25,10 +26,88 @@ IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
 LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
 IOU_THRESH = 0.5
 CONF_THRESH = 0.70
+MODEL_CONF_THRESH = {
+    "yolo8n": 0.6863484706628682,
+    "yolo8m": 0.7133918823950539,
+    "yolo9t": 0.6724046133517759,
+    "yolo10n": 0.5910035105688879,
+    "yolo11n": 0.712997868833143,
+    "yolo12n": 0.6838702654977842,
+    "yolo26n": 0.6052508580184951,
+}
 IMGSZ = 640
+
+TICK_LABEL_FONTSIZE = 16
+AXIS_LABEL_FONTSIZE = 16
+CELL_VALUE_FONTSIZE = 25 # Font size for the numbers inside the confusion matrix cells.
 
 SAVE_PLOT = True
 VERBOSE = False  # Print per-image matching/debug details during evaluation when True.
+
+
+def build_cache_file_path(detect_run_dir: Path, conf_thresh: float, iou_thresh: float, imgsz: int) -> Path:
+    cache_dir = detect_run_dir / "eval_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_name = (
+        f"metrics_conf_{conf_thresh:.6f}_iou_{iou_thresh:.2f}_imgsz_{imgsz}.json"
+        .replace(".", "p")
+    )
+    return cache_dir / cache_name
+
+
+def load_eval_cache(cache_path: Path):
+    if not cache_path.exists():
+        return None
+    try:
+        with cache_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    matrix_data = payload.get("matrix")
+    if not isinstance(matrix_data, list):
+        return None
+
+    matrix = np.array(matrix_data, dtype=int)
+    return {
+        "matrix": matrix,
+        "per_class_metrics": payload.get("per_class_metrics", []),
+        "macro_metrics": payload.get("macro_metrics", {}),
+        "summary_metrics": payload.get("summary_metrics", {}),
+        "total_known": int(payload.get("total_known", 0)),
+        "total_unknown": int(payload.get("total_unknown", 0)),
+    }
+
+
+def save_eval_cache(
+    cache_path: Path,
+    run_name: str,
+    conf_thresh: float,
+    iou_thresh: float,
+    imgsz: int,
+    matrix,
+    per_class_metrics,
+    macro_metrics,
+    summary_metrics,
+    total_known: int,
+    total_unknown: int,
+):
+    payload = {
+        "run_name": run_name,
+        "conf_thresh": float(conf_thresh),
+        "iou_thresh": float(iou_thresh),
+        "imgsz": int(imgsz),
+        "labels_dir": str(LABELS_DIR),
+        "images_dir": str(IMAGES_DIR),
+        "total_known": int(total_known),
+        "total_unknown": int(total_unknown),
+        "matrix": matrix.tolist(),
+        "per_class_metrics": per_class_metrics,
+        "macro_metrics": macro_metrics,
+        "summary_metrics": summary_metrics,
+    }
+    with cache_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
 
 def format_run_display_name(run_name: str) -> str:
@@ -204,17 +283,24 @@ def plot_confusion(matrix, save_path, title_prefix):
 
     ax.set_xticks(np.arange(len(CLASS_NAMES)))
     ax.set_yticks(np.arange(len(CLASS_NAMES)))
-    ax.set_xticklabels(CLASS_NAMES)
-    ax.set_yticklabels(CLASS_NAMES)
-    ax.set_xlabel("Ground Truth")
-    ax.set_ylabel("Predicted")
-    ax.set_title(f"{title_prefix} Confusion Matrix")
+    ax.set_xticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
+    ax.set_yticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
+    ax.set_xlabel("Ground Truth", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("Predicted", fontsize=AXIS_LABEL_FONTSIZE)
 
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
-            ax.text(j, i, matrix[i, j], ha="center", va="center", color="black")
+            text_color = "white" if i == 2 and j == 2 else "black"
+            ax.text(
+                j,
+                i,
+                matrix[i, j],
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=CELL_VALUE_FONTSIZE,
+            )
 
-    fig.colorbar(im, ax=ax)
     fig.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,11 +390,11 @@ def build_metrics_table_lines(per_class_metrics, macro_metrics):
         )
 
     lines.append("-" * len(header))
-    orange = "\033[38;5;214m"
+    red = "\033[38;2;255;42;0m"
     reset = "\033[0m"
     lines.append(
         f"{'macro-avg':<10}"
-        + orange
+        + red
         + f"{fmt_pct(macro_metrics['Precision']):>10}"
         + f"{fmt_pct(macro_metrics['Recall']):>10}"
         + f"{fmt_pct(macro_metrics['F1-score']):>10}"
@@ -376,6 +462,8 @@ def main():
 
     detect_run_dir = detect_root_dir / run_name
     run_display_name = format_run_display_name(run_name)
+    conf_thresh = MODEL_CONF_THRESH.get(run_name, CONF_THRESH)
+    cache_path = build_cache_file_path(detect_run_dir, conf_thresh, IOU_THRESH, IMGSZ)
     model_path = str(detect_run_dir / "weights" / "best.pt")
     save_plot_path = str(detect_run_dir / "confusion_matrix_eval.png")
     save_metrics_csv_path = str(detect_run_dir / "metrics_table_eval.csv")
@@ -407,34 +495,60 @@ def main():
     if len(image_paths) == 0:
         raise ValueError(f"No validation images found in {IMAGES_DIR}")
 
-    print(f"Running inference on {len(image_paths)} validation images...")
-    # Inference with progress bar
-    total_files = len(image_paths)
-    processed = 0
-    start_time = time.time()
-    results = []
-    for img_path in image_paths:
-        result = model.predict(
-            source=img_path,
-            conf=CONF_THRESH,
-            imgsz=IMGSZ,
-            verbose=False,
-        )
-        results.append(result[0] if isinstance(result, list) else result)
-        processed += 1
-        elapsed = time.time() - start_time
-        minutes, seconds = divmod(int(elapsed), 60)
-        print(f"Progress: {processed}/{total_files} ({processed / total_files * 100:.2f}%) Elapsed: {minutes}:{seconds:02d}", end='\r')
-    print()  # Newline after progress bar
+    cached = load_eval_cache(cache_path)
+    if cached is not None:
+        print(f"Using cached evaluation for {run_name} (conf={conf_thresh:.4f})")
+        matrix = cached["matrix"]
+        total_known = cached["total_known"]
+        total_unknown = cached["total_unknown"]
+        per_class_metrics = cached["per_class_metrics"]
+        macro_metrics = cached["macro_metrics"]
+        summary_metrics = cached["summary_metrics"]
+    else:
+        print(f"Running inference on {len(image_paths)} validation images (conf={conf_thresh:.4f})...")
+        # Inference with progress bar
+        total_files = len(image_paths)
+        processed = 0
+        start_time = time.time()
+        results = []
+        for img_path in image_paths:
+            result = model.predict(
+                source=img_path,
+                conf=conf_thresh,
+                imgsz=IMGSZ,
+                verbose=False,
+            )
+            results.append(result[0] if isinstance(result, list) else result)
+            processed += 1
+            elapsed = time.time() - start_time
+            minutes, seconds = divmod(int(elapsed), 60)
+            print(f"Progress: {processed}/{total_files} ({processed / total_files * 100:.2f}%) Elapsed: {minutes}:{seconds:02d}", end='\r')
+        print()  # Newline after progress bar
 
-    matrix, total_known, total_unknown = build_confusion_matrix(
-        results,
-        valid_label_paths,
-        IMAGES_DIR,
-        IOU_THRESH,
-        VERBOSE,
-    )
-    per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
+        matrix, total_known, total_unknown = build_confusion_matrix(
+            results,
+            valid_label_paths,
+            IMAGES_DIR,
+            IOU_THRESH,
+            VERBOSE,
+        )
+        per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
+
+        save_eval_cache(
+            cache_path=cache_path,
+            run_name=run_name,
+            conf_thresh=conf_thresh,
+            iou_thresh=IOU_THRESH,
+            imgsz=IMGSZ,
+            matrix=matrix,
+            per_class_metrics=per_class_metrics,
+            macro_metrics=macro_metrics,
+            summary_metrics=summary_metrics,
+            total_known=total_known,
+            total_unknown=total_unknown,
+        )
+        print(f"Saved evaluation cache: {cache_path}")
+
     print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics)
     print()
 
