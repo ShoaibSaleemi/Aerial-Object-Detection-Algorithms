@@ -1,4 +1,6 @@
+from itertools import zip_longest
 from pathlib import Path
+import json
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -27,13 +29,74 @@ CONFIG = {
     "images": str(PROJECT_ROOT / "dataset" / "validation" / "images"),
     "labels": str(PROJECT_ROOT / "dataset" / "validation" / "labels"),
     "iou_thresh": 0.5,
-    "conf_thresh": 0.5,
+    "conf_thresh": 0.85,
     "save_plot": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "confusion_matrix_val.png"),
     "save_metrics_plot": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "metrics_table_val.png"),
     "save_plot_enabled": True,
     "verbose": False,
     "device": "auto",  # "cpu", "cuda", or "auto"
 }
+
+TICK_LABEL_FONTSIZE = 16
+AXIS_LABEL_FONTSIZE = 16
+CELL_VALUE_FONTSIZE = 25
+
+
+def build_cache_file_path(run_dir: Path, conf_thresh: float, iou_thresh: float) -> Path:
+    cache_dir = run_dir / "eval_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_name = (
+        f"metrics_conf_{conf_thresh:.6f}_iou_{iou_thresh:.2f}.json"
+        .replace(".", "p")
+    )
+    return cache_dir / cache_name
+
+
+def load_eval_cache(cache_path: Path):
+    if not cache_path.exists():
+        return None
+    try:
+        with cache_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    matrix_data = payload.get("matrix")
+    if not isinstance(matrix_data, list):
+        return None
+
+    matrix = np.array(matrix_data, dtype=int)
+    return {
+        "matrix": matrix,
+        "per_class_metrics": payload.get("per_class_metrics", []),
+        "macro_metrics": payload.get("macro_metrics", {}),
+        "summary_metrics": payload.get("summary_metrics", {}),
+    }
+
+
+def save_eval_cache(
+    cache_path: Path,
+    checkpoint_path: Path,
+    conf_thresh: float,
+    iou_thresh: float,
+    matrix,
+    per_class_metrics,
+    macro_metrics,
+    summary_metrics,
+):
+    payload = {
+        "checkpoint": str(checkpoint_path),
+        "conf_thresh": float(conf_thresh),
+        "iou_thresh": float(iou_thresh),
+        "labels_dir": str(CONFIG["labels"]),
+        "images_dir": str(CONFIG["images"]),
+        "matrix": matrix.tolist(),
+        "per_class_metrics": per_class_metrics,
+        "macro_metrics": macro_metrics,
+        "summary_metrics": summary_metrics,
+    }
+    with cache_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
 
 def format_model_display_name(model_path: Path) -> str:
@@ -249,17 +312,24 @@ def plot_confusion(matrix, save_path, title_prefix):
 
     ax.set_xticks(np.arange(len(CLASS_NAMES)))
     ax.set_yticks(np.arange(len(CLASS_NAMES)))
-    ax.set_xticklabels(CLASS_NAMES)
-    ax.set_yticklabels(CLASS_NAMES)
-    ax.set_xlabel("Ground Truth")
-    ax.set_ylabel("Predicted")
-    ax.set_title(f"{title_prefix} Confusion Matrix")
+    ax.set_xticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
+    ax.set_yticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
+    ax.set_xlabel("Ground Truth", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("Predicted", fontsize=AXIS_LABEL_FONTSIZE)
 
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
-            ax.text(j, i, matrix[i, j], ha="center", va="center", color="black")
+            text_color = "white" if i == j else "black"
+            ax.text(
+                j,
+                i,
+                matrix[i, j],
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=CELL_VALUE_FONTSIZE,
+            )
 
-    fig.colorbar(im, ax=ax)
     fig.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -338,40 +408,58 @@ def compute_metrics_from_confusion(matrix):
     return per_class_metrics, macro_metrics, summary_metrics
 
 
-def print_metrics_table(per_class_metrics, macro_metrics, summary_metrics):
-    print("\nPer-class metrics:")
+def build_confusion_table_lines(matrix):
+    lines = ["Confusion matrix (rows: predicted, cols: GT):"]
+    row_label_w = 10
+    col_w = 8
+    for i, row in enumerate(matrix):
+        lines.append(
+            f"{CLASS_NAMES[i]:<{row_label_w}}"
+            + "".join(f"{int(x):>{col_w}}" for x in row)
+        )
+    lines.append(" " * row_label_w + "".join(f"{name:>{col_w}}" for name in CLASS_NAMES))
+    return lines
+
+
+def build_metrics_table_lines(per_class_metrics, macro_metrics):
+    lines = ["Per-class metrics:"]
     header = (
         f"{'Class':<10}"
-        f"{'TP':>8}{'FP':>8}{'FN':>8}{'TN':>8}"
-        f"{'Prec':>10}{'Recall':>10}{'F1':>10}{'Pfa':>10}{'P(success)':>14}"
+        f"{'Prec':>10}{'Recall':>10}{'F1':>10}"
     )
-    print(header)
-    print("-" * len(header))
+    lines.append(header)
+    lines.append("-" * len(header))
 
     for m in per_class_metrics:
-        print(
+        lines.append(
             f"{m['class']:<10}"
-            f"{m['TP']:>8}{m['FP']:>8}{m['FN']:>8}{m['TN']:>8}"
             f"{fmt_pct(m['Precision']):>10}"
             f"{fmt_pct(m['Recall']):>10}"
             f"{fmt_pct(m['F1-score']):>10}"
-            f"{fmt_pct(m['False Positive Rate']):>10}"
-            f"{fmt_pct(m['Detection Probability']):>14}"
         )
 
-    print("\nMacro-average metrics:")
-    print(f"Precision:             {fmt_pct(macro_metrics['Precision'])}")
-    print(f"Recall:                {fmt_pct(macro_metrics['Recall'])}")
-    print(f"F1-score:              {fmt_pct(macro_metrics['F1-score'])}")
-    print(f"False Positive Rate:   {fmt_pct(macro_metrics['False Positive Rate'])}")
-    print(f"Detection Probability: {fmt_pct(macro_metrics['Detection Probability'])}")
+    lines.append("-" * len(header))
+    red = "\033[38;2;255;42;0m"
+    reset = "\033[0m"
+    lines.append(
+        f"{'macro-avg':<10}"
+        + red
+        + f"{fmt_pct(macro_metrics['Precision']):>10}"
+        + f"{fmt_pct(macro_metrics['Recall']):>10}"
+        + f"{fmt_pct(macro_metrics['F1-score']):>10}"
+        + reset
+    )
+    return lines
 
-    print("\nOpen-set summary metrics:")
-    print(f"Known objects: {summary_metrics['Known objects']}")
-    print(f"Unknown objects: {summary_metrics['Unknown objects']}")
-    print(f"Known miss rate: {fmt_pct(summary_metrics['Known miss rate'])}")
-    print(f"Unknown false alarm rate: {fmt_pct(summary_metrics['Unknown false alarm rate'])}")
-    print(f"Unknown correct rejections: {summary_metrics['Unknown correct rejections']}")
+
+def print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics):
+    left_lines = build_confusion_table_lines(matrix)
+    right_lines = build_metrics_table_lines(per_class_metrics, macro_metrics)
+
+    left_width = max(len(line) for line in left_lines)
+    gap = 4
+    for left, right in zip_longest(left_lines, right_lines, fillvalue=""):
+        print(f"{left:<{left_width}}{' ' * gap}{right}")
 
 
 def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_path, title_prefix):
@@ -397,10 +485,7 @@ def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_p
 
     rows.append([
         "macro-avg",
-        "-",
-        "-",
-        "-",
-        "-",
+        "-", "-", "-", "-",
         fmt_pct(macro_metrics["Precision"]),
         fmt_pct(macro_metrics["Recall"]),
         fmt_pct(macro_metrics["F1-score"]),
@@ -410,13 +495,7 @@ def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_p
 
     rows.append([
         "open-set",
-        "-",
-        "-",
-        "-",
-        "-",
-        "-",
-        "-",
-        "-",
+        "-", "-", "-", "-", "-", "-", "-",
         fmt_pct(summary_metrics["Unknown false alarm rate"]),
         fmt_pct(1.0 - summary_metrics["Known miss rate"]) if not np.isnan(summary_metrics["Known miss rate"]) else "nan",
     ])
@@ -458,8 +537,8 @@ def main():
     labels_dir = CONFIG["labels"]
     iou_thresh = CONFIG["iou_thresh"]
     conf_thresh = CONFIG["conf_thresh"]
-    save_plot = CONFIG["save_plot"]
-    save_metrics_plot = CONFIG["save_metrics_plot"]
+    save_plot = Path(CONFIG["save_plot"])
+    save_metrics_plot = Path(CONFIG["save_metrics_plot"])
     save_plot_enabled = CONFIG["save_plot_enabled"]
     verbose = CONFIG["verbose"]
     device = CONFIG["device"]
@@ -472,6 +551,10 @@ def main():
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     model_display_name = format_model_display_name(checkpoint_path)
+    run_dir = checkpoint_path.parent
+    cache_path = build_cache_file_path(run_dir, conf_thresh, iou_thresh)
+    save_plot_path = save_plot
+    save_metrics_plot_path = save_metrics_plot
 
     label_dir = Path(labels_dir)
     if not label_dir.exists():
@@ -499,42 +582,57 @@ def main():
     if len(image_paths) == 0:
         raise ValueError(f"No validation images found in {images_dir}")
 
-    print(f"Loading model from {checkpoint_path}...")
-    model = build_model(checkpoint_path, device=device)
+    cached = load_eval_cache(cache_path)
+    if cached is not None:
+        print(f"Using cached evaluation (conf={conf_thresh:.4f}, iou={iou_thresh:.2f})")
+        matrix = cached["matrix"]
+        per_class_metrics = cached["per_class_metrics"]
+        macro_metrics = cached["macro_metrics"]
+        summary_metrics = cached["summary_metrics"]
+    else:
+        print(f"Loading model from {checkpoint_path}...")
+        model = build_model(checkpoint_path, device=device)
 
-    print(f"Running inference on {len(image_paths)} validation images...")
+        print(f"Running inference on {len(image_paths)} validation images (conf={conf_thresh:.4f})...")
 
-    matrix, _, _ = build_confusion_matrix(
-        model,
-        image_paths,
-        valid_label_paths,
-        conf_thresh,
-        iou_thresh,
-        verbose,
-        device,
-    )
+        matrix, _, _ = build_confusion_matrix(
+            model,
+            image_paths,
+            valid_label_paths,
+            conf_thresh,
+            iou_thresh,
+            verbose,
+            device,
+        )
 
-    print("\nConfusion matrix (rows: predicted, cols: GT):")
-    print("\t" + "\t".join(CLASS_NAMES))
-    for i, row in enumerate(matrix):
-        print(f"{CLASS_NAMES[i]}\t" + "\t".join(str(x) for x in row))
+        per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
+        save_eval_cache(
+            cache_path=cache_path,
+            checkpoint_path=checkpoint_path,
+            conf_thresh=conf_thresh,
+            iou_thresh=iou_thresh,
+            matrix=matrix,
+            per_class_metrics=per_class_metrics,
+            macro_metrics=macro_metrics,
+            summary_metrics=summary_metrics,
+        )
+        print(f"Saved evaluation cache: {cache_path}")
 
-    per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
-    print_metrics_table(per_class_metrics, macro_metrics, summary_metrics)
+    print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics)
     print()
 
     if save_plot_enabled:
-        plot_confusion(matrix, save_plot, model_display_name)
-        print(f"Saved confusion matrix plot to {save_plot}")
+        plot_confusion(matrix, save_plot_path, model_display_name)
+        print(f"Saved confusion matrix plot to {save_plot_path}")
 
         plot_metrics_table(
             per_class_metrics=per_class_metrics,
             macro_metrics=macro_metrics,
             summary_metrics=summary_metrics,
-            save_path=save_metrics_plot,
+            save_path=save_metrics_plot_path,
             title_prefix=model_display_name,
         )
-        print(f"Saved metrics table plot to {save_metrics_plot}")
+        print(f"Saved metrics table plot to {save_metrics_plot_path}")
 
 
 if __name__ == "__main__":
