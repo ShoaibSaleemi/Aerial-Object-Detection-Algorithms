@@ -25,7 +25,20 @@ IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
 LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
 IOU_THRESH = 0.5
 CONF_THRESH = 0.70
+MODEL_CONF_THRESH = {
+    "yolo8n": 0.6863484706628682,
+    "yolo8m": 0.7133918823950539,
+    "yolo9t": 0.6724046133517759,
+    "yolo10n": 0.5910035105688879,
+    "yolo11n": 0.712997868833143,
+    "yolo12n": 0.6838702654977842,
+    "yolo26n": 0.6052508580184951,
+}
 IMGSZ = 640
+
+TICK_LABEL_FONTSIZE = 14
+AXIS_LABEL_FONTSIZE = 16
+CELL_VALUE_FONTSIZE = 20
 
 SAVE_PLOT = True
 VERBOSE = False  # Print per-image matching/debug details during evaluation when True.
@@ -204,17 +217,32 @@ def plot_confusion(matrix, save_path, title_prefix):
 
     ax.set_xticks(np.arange(len(CLASS_NAMES)))
     ax.set_yticks(np.arange(len(CLASS_NAMES)))
-    ax.set_xticklabels(CLASS_NAMES)
-    ax.set_yticklabels(CLASS_NAMES)
-    ax.set_xlabel("Ground Truth")
-    ax.set_ylabel("Predicted")
-    ax.set_title(f"{title_prefix} Confusion Matrix")
+    ax.set_xticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
+    ax.set_yticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
+    ax.set_xlabel("Ground Truth", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("Predicted", fontsize=AXIS_LABEL_FONTSIZE)
 
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
-            ax.text(j, i, matrix[i, j], ha="center", va="center", color="black")
+            text_color = "white" if i == 2 and j == 2 else "black"
+            ax.text(
+                j,
+                i,
+                matrix[i, j],
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=CELL_VALUE_FONTSIZE,
+            )
 
-    fig.colorbar(im, ax=ax)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar_pos = cbar.ax.get_position()
+    cbar.ax.set_position([
+        cbar_pos.x0,
+        cbar_pos.y0 - 0.2,
+        cbar_pos.width,
+        cbar_pos.height,
+    ])
     fig.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,11 +332,11 @@ def build_metrics_table_lines(per_class_metrics, macro_metrics):
         )
 
     lines.append("-" * len(header))
-    orange = "\033[38;5;214m"
+    red = "\033[38;2;255;42;0m"
     reset = "\033[0m"
     lines.append(
         f"{'macro-avg':<10}"
-        + orange
+        + red
         + f"{fmt_pct(macro_metrics['Precision']):>10}"
         + f"{fmt_pct(macro_metrics['Recall']):>10}"
         + f"{fmt_pct(macro_metrics['F1-score']):>10}"
@@ -376,6 +404,7 @@ def main():
 
     detect_run_dir = detect_root_dir / run_name
     run_display_name = format_run_display_name(run_name)
+    conf_thresh = MODEL_CONF_THRESH.get(run_name, CONF_THRESH)
     model_path = str(detect_run_dir / "weights" / "best.pt")
     save_plot_path = str(detect_run_dir / "confusion_matrix_eval.png")
     save_metrics_csv_path = str(detect_run_dir / "metrics_table_eval.csv")
@@ -407,7 +436,7 @@ def main():
     if len(image_paths) == 0:
         raise ValueError(f"No validation images found in {IMAGES_DIR}")
 
-    print(f"Running inference on {len(image_paths)} validation images...")
+    print(f"Running inference on {len(image_paths)} validation images (conf={conf_thresh:.4f})...")
     # Inference with progress bar
     total_files = len(image_paths)
     processed = 0
@@ -416,7 +445,7 @@ def main():
     for img_path in image_paths:
         result = model.predict(
             source=img_path,
-            conf=CONF_THRESH,
+            conf=conf_thresh,
             imgsz=IMGSZ,
             verbose=False,
         )
