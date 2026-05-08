@@ -25,12 +25,12 @@ LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
 IOU_THRESH = 0.5
 CONF_THRESH = 0.70
 MODEL_CONF_THRESH = {
-    "yolo8n": 0.70,
-    "yolo9t": 0.70,
-    "yolo10n": 0.70,
-    "yolo11n": 0.70,
-    "yolo12n": 0.70,
-    "yolo26n": 0.70,
+    "yolo8n":  0.6863484706628682,
+    "yolo9t":  0.6724046133517759,
+    "yolo10n": 0.5910035105688879,
+    "yolo11n": 0.712997868833143,
+    "yolo12n": 0.6838702654977842,
+    "yolo26n": 0.6052508580184951,
 }
 FUSION_IOU_THRESH = 0.50
 IMGSZ = 640

@@ -30,7 +30,7 @@ CONFIG = {
     "labels": str(PROJECT_ROOT / "dataset" / "validation" / "labels"),
     "iou_thresh": 0.5,
     "conf_thresh": 0.996286,
-    "save_plot": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "confusion_matrix_val.png"),
+    "save_plot": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "fasterrcnn.png"),
     "save_metrics_plot": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "metrics_table_val.png"),
     "save_plot_enabled": True,
     "verbose": False,
@@ -40,6 +40,7 @@ CONFIG = {
 TICK_LABEL_FONTSIZE = 22
 AXIS_LABEL_FONTSIZE = 22
 CELL_VALUE_FONTSIZE = 33
+PREDICTED_LABEL_PAD = -14   # Distance (points) between "Predicted" label and the matrix; decrease to move closer.
 
 
 def build_cache_file_path(run_dir: Path, conf_thresh: float, iou_thresh: float) -> Path:
@@ -315,7 +316,7 @@ def plot_confusion(matrix, save_path, title_prefix):
     ax.set_xticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
     ax.set_yticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
     ax.set_xlabel("Ground Truth", fontsize=AXIS_LABEL_FONTSIZE)
-    ax.set_ylabel("Predicted", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("Predicted", fontsize=AXIS_LABEL_FONTSIZE, labelpad=PREDICTED_LABEL_PAD)
 
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):

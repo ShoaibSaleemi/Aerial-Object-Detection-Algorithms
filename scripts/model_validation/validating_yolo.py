@@ -582,15 +582,21 @@ def main():
         print()
 
         if SAVE_PLOT:
-            plot_confusion(matrix, save_plot_path, run_display_name)
-            print(f"Saved confusion matrix plot to {save_plot_path}")
+            if save_plot_path.exists():
+                print(f"Plot already exists, skipping: {save_plot_path.name}")
+            else:
+                plot_confusion(matrix, save_plot_path, run_display_name)
+                print(f"Saved confusion matrix plot to {save_plot_path}")
 
-            save_metrics_table_csv(
-                per_class_metrics=per_class_metrics,
-                macro_metrics=macro_metrics,
-                save_path=save_metrics_csv_path,
-            )
-            print(f"Saved metrics table CSV to {save_metrics_csv_path}")
+            if save_metrics_csv_path.exists():
+                print(f"CSV already exists, skipping: {save_metrics_csv_path.name}")
+            else:
+                save_metrics_table_csv(
+                    per_class_metrics=per_class_metrics,
+                    macro_metrics=macro_metrics,
+                    save_path=save_metrics_csv_path,
+                )
+                print(f"Saved metrics table CSV to {save_metrics_csv_path}")
 
 
 if __name__ == "__main__":
