@@ -23,9 +23,13 @@ random.seed(0)
 
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
+# Toggle between validation and test dataset
+USE_TEST_DATASET = True  # Set to True to evaluate on test dataset, False for validation
+
 # Edit evaluation parameters here.
-IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
-LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
+DATASET_SPLIT = "test" if USE_TEST_DATASET else "validation"
+IMAGES_DIR = PROJECT_ROOT / "dataset" / DATASET_SPLIT / "images"
+LABELS_DIR = PROJECT_ROOT / "dataset" / DATASET_SPLIT / "labels"
 IOU_THRESH = 0.5
 # MODEL_CONF_THRESH holds per-model thresholds tuned for standard post-NMS YOLO inference.
 # They are NOT used in the WC-NMS inference path (raw scores are lower); kept for reference.
@@ -49,16 +53,16 @@ WCNMS_CONF_THRESH = 0.30
 RUN_ALL_MODELS = True
 ENABLED_MODELS = {
     "yolo8n":  True,
-    "yolo8m":  False,
-    "yolo9t":  False,
-    "yolo10n": False,
-    "yolo11n": False,
-    "yolo12n": False,
-    "yolo26n": False,
+    "yolo8m":  True,
+    "yolo9t":  True,
+    "yolo10n": True,
+    "yolo11n": True,
+    "yolo12n": True,
+    "yolo26n": True,
 }
 # -----------------------------------------------------------------------------
 
-NMS_THRESH = 0.50
+NMS_THRESH = 0.50   
 IMGSZ = 640
 MAX_DET = 300
 
@@ -81,11 +85,12 @@ def build_cache_file_path(
     iou_thresh: float,
     imgsz: int,
     nms_thresh: float,
+    split: str,
 ) -> Path:
     cache_dir = detect_run_dir / "eval_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_name = (
-        f"wcnms_metrics_conf_{conf_thresh:.6f}_iou_{iou_thresh:.2f}_"
+        f"{split}_wcnms_metrics_conf_{conf_thresh:.6f}_iou_{iou_thresh:.2f}_"
         f"imgsz_{imgsz}_nms_{nms_thresh:.2f}.json"
     ).replace(".", "p")
     return cache_dir / cache_name
@@ -771,9 +776,11 @@ def main():
             valid_label_paths.append(label_path)
 
     if len(image_paths) == 0:
-        raise ValueError(f"No validation images found in {IMAGES_DIR}")
+        raise ValueError(f"No {DATASET_SPLIT} images found in {IMAGES_DIR}")
 
     EVAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    all_model_rows = []  # Accumulates rows for the combined summary CSV
 
     for run_name in run_names:
         detect_run_dir = detect_root_dir / run_name
@@ -788,9 +795,8 @@ def main():
 
         run_display_name = format_run_display_name(run_name)
         conf_thresh = WCNMS_CONF_THRESH
-        cache_path = build_cache_file_path(detect_run_dir, conf_thresh, IOU_THRESH, IMGSZ, NMS_THRESH)
+        cache_path = build_cache_file_path(detect_run_dir, conf_thresh, IOU_THRESH, IMGSZ, NMS_THRESH, DATASET_SPLIT)
         save_plot_path = EVAL_OUTPUT_DIR / f"{run_name}_WC-NMS.png"
-        save_metrics_csv_path = EVAL_OUTPUT_DIR / f"{run_name}_WC-NMS_metrics.csv"
 
         cached = load_eval_cache(cache_path)
         if cached is not None:
@@ -802,7 +808,7 @@ def main():
             macro_metrics = cached["macro_metrics"]
             summary_metrics = cached["summary_metrics"]
         else:
-            print(f"Running WC-NMS inference on {len(image_paths)} validation images (pre-nms-conf={conf_thresh:.2f})...")
+            print(f"Running WC-NMS inference on {len(image_paths)} {DATASET_SPLIT} images (pre-nms-conf={conf_thresh:.2f})...")
             model = YOLO(str(model_pt))
             model.model.eval()
 
@@ -866,22 +872,45 @@ def main():
         print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics)
         print()
 
-        if SAVE_PLOT:
-            if save_plot_path.exists():
-                print(f"Plot already exists, skipping: {save_plot_path.name}")
-            else:
-                plot_confusion(matrix, save_plot_path, run_display_name)
-                print(f"Saved confusion matrix plot to {save_plot_path}")
+        # Accumulate rows for combined summary CSV
+        for m in per_class_metrics:
+            all_model_rows.append([
+                run_display_name + " WC-NMS",
+                m["class"],
+                f"{m['Precision'] * 100:.2f}".replace('.', ',') if not np.isnan(m["Precision"]) else "nan",
+                f"{m['Recall'] * 100:.2f}".replace('.', ',') if not np.isnan(m["Recall"]) else "nan",
+                f"{m['F1-score'] * 100:.2f}".replace('.', ',') if not np.isnan(m["F1-score"]) else "nan",
+            ])
+        all_model_rows.append([
+            run_display_name + " WC-NMS",
+            "average",
+            f"{macro_metrics['Precision'] * 100:.2f}".replace('.', ',') if not np.isnan(macro_metrics["Precision"]) else "nan",
+            f"{macro_metrics['Recall'] * 100:.2f}".replace('.', ',') if not np.isnan(macro_metrics["Recall"]) else "nan",
+            f"{macro_metrics['F1-score'] * 100:.2f}".replace('.', ',') if not np.isnan(macro_metrics["F1-score"]) else "nan",
+        ])
 
-            if save_metrics_csv_path.exists():
-                print(f"CSV already exists, skipping: {save_metrics_csv_path.name}")
-            else:
-                save_metrics_table_csv(
-                    per_class_metrics=per_class_metrics,
-                    macro_metrics=macro_metrics,
-                    save_path=save_metrics_csv_path,
-                )
-                print(f"Saved metrics table CSV to {save_metrics_csv_path}")
+        if SAVE_PLOT:
+            plot_confusion(matrix, save_plot_path, run_display_name)
+            print(f"Saved confusion matrix plot to {save_plot_path}")
+
+    # Save combined summary CSV for all models
+    if all_model_rows:
+        combined_csv_path = EVAL_OUTPUT_DIR / "all_models_metrics.csv"
+        wcnms_model_names = {row[0] for row in all_model_rows}
+        preserved_rows = []
+        if combined_csv_path.exists():
+            with combined_csv_path.open("r", newline="", encoding="utf-8") as csv_file:
+                reader = csv.reader(csv_file)
+                next(reader, None)  # skip header
+                for row in reader:
+                    if row and row[0] not in wcnms_model_names:
+                        preserved_rows.append(row)
+        with combined_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["Model", "Class", "Precision", "Recall", "F1"])
+            writer.writerows(all_model_rows)
+            writer.writerows(preserved_rows)
+        print(f"\nSaved combined metrics CSV to {combined_csv_path}")
 
 
 if __name__ == "__main__":
