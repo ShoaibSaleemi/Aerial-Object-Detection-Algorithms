@@ -41,8 +41,8 @@ IOU_THRESH = 0.5
 CONF_INFER = 0.001
 
 CONF_MIN = 0.55
-CONF_MAX = 0.85
-N_STEPS = 200
+CONF_MAX = 1.00
+N_STEPS = 1000
 
 IMAGE_EXTENSIONS = [".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff"]
 
