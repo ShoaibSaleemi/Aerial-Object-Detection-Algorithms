@@ -1,3 +1,5 @@
+import csv
+import json
 import random
 import sys
 import time
@@ -6,7 +8,6 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import questionary
 import torch
 from PIL import Image
 from ultralytics import YOLO
@@ -23,44 +24,135 @@ random.seed(0)
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
 # Edit evaluation parameters here.
-IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"  # Directory containing validation images.
-LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"  # Directory containing YOLO-format validation label files.
-IOU_THRESH = 0.5  # IoU threshold to match prediction with GT in confusion matrix counting.
-CONF_THRESH = 0.70  # Minimum class confidence before applying custom WC-NMS.
-NMS_THRESH = 0.50  # EIoU threshold inside Weighted-Cluster NMS (lower = more suppression).
-IMGSZ = 640  # Inference image size used by letterbox preprocessing.
-MAX_DET = 300  # Max raw detections retained before WC-NMS.
-SAVE_PLOTS = True  # Save confusion-matrix and metrics-table figures when True.
-DEVICE = ""  # Device string: "cpu", "0", "0,1"; empty string uses default device.
-VERBOSE = False  # Print per-image matching stats when True.
+IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
+LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
+IOU_THRESH = 0.5
+# MODEL_CONF_THRESH holds per-model thresholds tuned for standard post-NMS YOLO inference.
+# They are NOT used in the WC-NMS inference path (raw scores are lower); kept for reference.
+CONF_THRESH = 0.70  # Fallback post-NMS threshold (reference only).
+MODEL_CONF_THRESH = {
+    "yolo8n":  0.6863484706628682,
+    "yolo8m":  0.7133918823950539,
+    "yolo9t":  0.6724046133517759,
+    "yolo10n": 0.5910035105688879,
+    "yolo11n": 0.712997868833143,
+    "yolo12n": 0.6838702654977842,
+    "yolo26n": 0.6052508580184951,
+}
+# Pre-WC-NMS confidence threshold applied to raw class scores before clustering.
+# Raw scores are lower than post-NMS YOLO scores, so this must be well below MODEL_CONF_THRESH.
+WCNMS_CONF_THRESH = 0.30
+
+# --- Model selection ---------------------------------------------------------
+# Set a model to True to include it in evaluation, False to skip it.
+# Set RUN_ALL_MODELS = True to override and run every model regardless.
+RUN_ALL_MODELS = True
+ENABLED_MODELS = {
+    "yolo8n":  True,
+    "yolo8m":  False,
+    "yolo9t":  False,
+    "yolo10n": False,
+    "yolo11n": False,
+    "yolo12n": False,
+    "yolo26n": False,
+}
+# -----------------------------------------------------------------------------
+
+NMS_THRESH = 0.50
+IMGSZ = 640
+MAX_DET = 300
+
+TICK_LABEL_FONTSIZE = 22
+AXIS_LABEL_FONTSIZE = 22
+CELL_VALUE_FONTSIZE = 33
+PREDICTED_LABEL_PAD = -14
+
+SAVE_PLOT = True
+VERBOSE = False
+DEVICE = ""
+
+# Folder where evaluation outputs are saved.
+EVAL_OUTPUT_DIR = PROJECT_ROOT / "runs" / "eval_wcnms"
 
 
-def choose_run_folder() -> str:
-    detect_root = PROJECT_ROOT / "runs" / "detect"
-    if not detect_root.exists():
-        raise FileNotFoundError(f"Directory not found: {detect_root}")
+def build_cache_file_path(
+    detect_run_dir: Path,
+    conf_thresh: float,
+    iou_thresh: float,
+    imgsz: int,
+    nms_thresh: float,
+) -> Path:
+    cache_dir = detect_run_dir / "eval_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_name = (
+        f"wcnms_metrics_conf_{conf_thresh:.6f}_iou_{iou_thresh:.2f}_"
+        f"imgsz_{imgsz}_nms_{nms_thresh:.2f}.json"
+    ).replace(".", "p")
+    return cache_dir / cache_name
 
-    yolo_runs = sorted(
-        path.name for path in detect_root.iterdir()
-        if path.is_dir() and path.name.lower().startswith("yolo")
-    )
-    if not yolo_runs:
-        raise ValueError(f"No yolo* folders found in {detect_root}")
 
-    if len(sys.argv) > 1:
-        run_name = sys.argv[1]
-        if run_name not in yolo_runs:
-            raise ValueError(
-                f"Unknown folder '{run_name}'. Choose one of: {', '.join(yolo_runs)}"
-            )
-        return run_name
+def load_eval_cache(cache_path: Path):
+    if not cache_path.exists():
+        return None
+    try:
+        with cache_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    matrix_data = payload.get("matrix")
+    if not isinstance(matrix_data, list):
+        return None
+    matrix = np.array(matrix_data, dtype=int)
+    return {
+        "matrix": matrix,
+        "per_class_metrics": payload.get("per_class_metrics", []),
+        "macro_metrics": payload.get("macro_metrics", {}),
+        "summary_metrics": payload.get("summary_metrics", {}),
+        "total_known": int(payload.get("total_known", 0)),
+        "total_unknown": int(payload.get("total_unknown", 0)),
+    }
 
-    run_name = questionary.select(
-        "Choose a YOLO run folder from runs/detect:",
-        choices=yolo_runs,
-    ).ask()
-    if not run_name:
-        raise ValueError("No folder selected.")
+
+def save_eval_cache(
+    cache_path: Path,
+    run_name: str,
+    conf_thresh: float,
+    iou_thresh: float,
+    imgsz: int,
+    nms_thresh: float,
+    matrix,
+    per_class_metrics,
+    macro_metrics,
+    summary_metrics,
+    total_known: int,
+    total_unknown: int,
+):
+    payload = {
+        "run_name": run_name,
+        "method": "WC-NMS",
+        "conf_thresh": float(conf_thresh),
+        "iou_thresh": float(iou_thresh),
+        "imgsz": int(imgsz),
+        "nms_thresh": float(nms_thresh),
+        "labels_dir": str(LABELS_DIR),
+        "images_dir": str(IMAGES_DIR),
+        "total_known": int(total_known),
+        "total_unknown": int(total_unknown),
+        "matrix": matrix.tolist(),
+        "per_class_metrics": per_class_metrics,
+        "macro_metrics": macro_metrics,
+        "summary_metrics": summary_metrics,
+    }
+    with cache_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def format_run_display_name(run_name: str) -> str:
+    lower_name = run_name.lower()
+    if lower_name.startswith("yolo") and len(run_name) > 4:
+        suffix = run_name[4:]
+        if suffix and suffix[0].isdigit():
+            return f"YOLOv{suffix}"
     return run_name
 
 
@@ -159,23 +251,30 @@ def match_predictions(gt_boxes, gt_labels, pred_boxes, pred_labels, iou_thresh):
     return assignments, used_pred
 
 
-def plot_confusion(matrix, save_path):
+def plot_confusion(matrix, save_path, title_prefix):
     fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(matrix, cmap="Blues")
+    ax.imshow(matrix, cmap="Blues")
 
     ax.set_xticks(np.arange(len(CLASS_NAMES)))
     ax.set_yticks(np.arange(len(CLASS_NAMES)))
-    ax.set_xticklabels(CLASS_NAMES)
-    ax.set_yticklabels(CLASS_NAMES)
-    ax.set_xlabel("Ground Truth")
-    ax.set_ylabel("Predicted")
-    ax.set_title("Open-Set Confusion Matrix")
+    ax.set_xticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
+    ax.set_yticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
+    ax.set_xlabel("Ground Truth", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("Predicted", fontsize=AXIS_LABEL_FONTSIZE, labelpad=PREDICTED_LABEL_PAD)
 
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
-            ax.text(j, i, matrix[i, j], ha="center", va="center", color="black")
+            text_color = "white" if i == 2 and j == 2 else "black"
+            ax.text(
+                j,
+                i,
+                matrix[i, j],
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=CELL_VALUE_FONTSIZE,
+            )
 
-    fig.colorbar(im, ax=ax)
     fig.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,12 +307,6 @@ def compute_metrics_from_confusion(matrix):
             np.isnan(precision) or np.isnan(recall)
         ) else float("nan")
 
-        # Thesis-style false alarm / false positive ratio from positive decisions
-        pfa = safe_div(fp, tp + fp)
-
-        # Detection probability = 1 - miss probability = TP / (TP + FN)
-        p_success = recall
-
         per_class_metrics.append({
             "class": CLASS_NAMES[c],
             "TP": tp,
@@ -223,40 +316,21 @@ def compute_metrics_from_confusion(matrix):
             "Precision": precision,
             "Recall": recall,
             "F1-score": f1,
-            "False Positive Rate": pfa,
-            "Detection Probability": p_success,
         })
 
     macro_metrics = {
         "Precision": np.nanmean([m["Precision"] for m in per_class_metrics]),
         "Recall": np.nanmean([m["Recall"] for m in per_class_metrics]),
         "F1-score": np.nanmean([m["F1-score"] for m in per_class_metrics]),
-        "False Positive Rate": np.nanmean([m["False Positive Rate"] for m in per_class_metrics]),
-        "Detection Probability": np.nanmean([m["Detection Probability"] for m in per_class_metrics]),
     }
 
-    total_known = int(matrix[:, 0].sum() + matrix[:, 1].sum())
-    total_unknown = int(matrix[:, 2].sum())
-
-    known_misses = int(matrix[2, 0] + matrix[2, 1])
-    unknown_false_alarms = int(matrix[0, 2] + matrix[1, 2])
-    unknown_correct_rejections = int(matrix[2, 2])
-
-    summary_metrics = {
-        "Known objects": total_known,
-        "Unknown objects": total_unknown,
-        "Known miss rate": safe_div(known_misses, total_known),
-        "Unknown false alarm rate": safe_div(unknown_false_alarms, total_unknown),
-        "Unknown correct rejections": unknown_correct_rejections,
-    }
+    summary_metrics = {}
 
     return per_class_metrics, macro_metrics, summary_metrics
 
 
-def fmt_pct(value: float) -> str:
-    if value is None or (isinstance(value, float) and np.isnan(value)):
-        return "nan"
-    return f"{value:.4f}"
+def fmt_pct(x):
+    return f"{x * 100:.2f}%" if not np.isnan(x) else "nan"
 
 
 def build_confusion_table_lines(matrix):
@@ -313,82 +387,27 @@ def print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_me
         print(f"{left:<{left_width}}{' ' * gap}{right}")
 
 
-def plot_metrics_table(per_class_metrics, macro_metrics, summary_metrics, save_path):
+def save_metrics_table_csv(per_class_metrics, macro_metrics, save_path):
     rows = []
-    columns = [
-        "Class", "TP", "FP", "FN", "TN",
-        "Precision", "Recall", "F1-score", "Pfa", "P(success)"
-    ]
-
     for m in per_class_metrics:
         rows.append([
             m["class"],
-            m["TP"],
-            m["FP"],
-            m["FN"],
-            m["TN"],
-            f"{m['Precision']:.4f}",
-            f"{m['Recall']:.4f}",
-            f"{m['F1-score']:.4f}",
-            f"{m['False Positive Rate']:.4f}",
-            f"{m['Detection Probability']:.4f}",
+            fmt_pct(m["Precision"]),
+            fmt_pct(m["Recall"]),
+            fmt_pct(m["F1-score"]),
         ])
-
     rows.append([
         "macro-avg",
-        "-",
-        "-",
-        "-",
-        "-",
-        f"{macro_metrics['Precision']:.4f}",
-        f"{macro_metrics['Recall']:.4f}",
-        f"{macro_metrics['F1-score']:.4f}",
-        f"{macro_metrics['False Positive Rate']:.4f}",
-        f"{macro_metrics['Detection Probability']:.4f}",
+        fmt_pct(macro_metrics["Precision"]),
+        fmt_pct(macro_metrics["Recall"]),
+        fmt_pct(macro_metrics["F1-score"]),
     ])
-
-    rows.append([
-        "open-set",
-        "-",
-        "-",
-        "-",
-        "-",
-        "-",
-        "-",
-        "-",
-        f"{summary_metrics['Unknown false alarm rate']:.4f}",
-        f"{1.0 - summary_metrics['Known miss rate']:.4f}" if not np.isnan(summary_metrics["Known miss rate"]) else "nan",
-    ])
-
-    fig_h = 2.6 + 0.5 * len(rows)
-    fig, ax = plt.subplots(figsize=(13, fig_h))
-    ax.axis("off")
-    ax.set_title("Evaluation Metrics Table", fontsize=14, pad=12)
-
-    table = ax.table(
-        cellText=rows,
-        colLabels=columns,
-        cellLoc="center",
-        loc="center",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 1.5)
-
-    footer_text = (
-        f"Known objects: {summary_metrics['Known objects']}    "
-        f"Unknown objects: {summary_metrics['Unknown objects']}    "
-        f"Known miss rate: {summary_metrics['Known miss rate']:.4f}    "
-        f"Unknown false alarm rate: {summary_metrics['Unknown false alarm rate']:.4f}    "
-        f"Unknown correct rejections: {summary_metrics['Unknown correct rejections']}"
-    )
-    fig.text(0.5, 0.03, footer_text, ha="center", fontsize=10)
-
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout(rect=[0.02, 0.08, 0.98, 0.98])
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    with save_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["Class", "Precision", "Recall", "F1-score"])
+        writer.writerows(rows)
 
 
 def preprocess_image_for_yolo(image_path: Path, imgsz: int, device: torch.device):
@@ -709,122 +728,160 @@ def build_confusion_matrix(all_predictions, label_paths, images_dir, iou_thresh,
 
 
 def main():
-    run_name = choose_run_folder()
-    run_dir = PROJECT_ROOT / "runs" / "detect" / run_name
-    model_path = run_dir / "weights" / "best.pt"
-    save_plot_path = run_dir / "confusion_matrix_eval.png"
-    save_metrics_plot_path = run_dir / "metrics_table_eval.png"
+    detect_root_dir = PROJECT_ROOT / "runs" / "detect"
+    available_runs = sorted(
+        [
+            path.name
+            for path in detect_root_dir.iterdir()
+            if path.is_dir() and path.name.lower().startswith("yolo")
+        ]
+    )
 
-    label_dir = Path(LABELS_DIR)
+    if len(available_runs) == 0:
+        raise ValueError(f"No yolo* folders found in {detect_root_dir}")
+
+    if len(sys.argv) > 1:
+        run_names = [sys.argv[1]]
+        if run_names[0] not in available_runs:
+            available_text = ", ".join(available_runs)
+            raise ValueError(
+                f"Unknown folder '{run_names[0]}'. Choose one from runs/detect: {available_text}"
+            )
+    elif RUN_ALL_MODELS:
+        run_names = available_runs
+    else:
+        run_names = [name for name in available_runs if ENABLED_MODELS.get(name, False)]
+        if not run_names:
+            raise ValueError("No models enabled. Set RUN_ALL_MODELS=True or enable at least one in ENABLED_MODELS.")
+
+    label_dir = LABELS_DIR
     if not label_dir.exists():
         raise FileNotFoundError(f"Label directory not found: {label_dir}")
 
-    label_paths = sorted(label_dir.glob("*.txt"))
+    label_paths = list(label_dir.glob("*.txt"))
     if len(label_paths) == 0:
         raise ValueError(f"No label files found in {label_dir}")
 
-    model = YOLO(str(model_path))
-    model.model.eval()
-
-    if DEVICE:
-        model.to(DEVICE)
-        device = next(model.model.parameters()).device
-    else:
-        device = next(model.model.parameters()).device
-
-    valid_label_paths = []
     image_paths = []
-    for label_path in label_paths:
-        image_path = resolve_image_path(Path(IMAGES_DIR), label_path.stem)
+    valid_label_paths = []
+    for label_path in sorted(label_paths):
+        image_path = resolve_image_path(IMAGES_DIR, label_path.stem)
         if image_path is not None:
-            valid_label_paths.append(label_path)
             image_paths.append(image_path)
+            valid_label_paths.append(label_path)
 
     if len(image_paths) == 0:
         raise ValueError(f"No validation images found in {IMAGES_DIR}")
 
-    print(f"Running YOLO baseline + EIoU Weighted-Cluster NMS on {len(image_paths)} validation images...")
+    EVAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    total_files = len(image_paths)
-    processed = 0
-    start_time = time.time()
-    all_predictions_yolo = []
-    all_predictions_wcnms = []
+    for run_name in run_names:
+        detect_run_dir = detect_root_dir / run_name
+        model_pt = detect_run_dir / "weights" / "best.pt"
+        if not model_pt.exists():
+            print(f"[SKIP] {run_name}: no weights/best.pt found")
+            continue
 
-    for img_path in image_paths:
-        yolo_boxes, yolo_labels, yolo_scores = run_yolo_inference_before_wc_nms(
-            model=model,
-            image_path=img_path,
-            device=device,
-            imgsz=IMGSZ,
-            conf_thresh=CONF_THRESH,
-            max_det=MAX_DET,
-        )
-        all_predictions_yolo.append((yolo_boxes, yolo_labels, yolo_scores))
+        print(f"\n{'=' * 60}")
+        print(f"  Model: {run_name}")
+        print(f"{'=' * 60}")
 
-        pred_boxes, pred_labels, pred_scores = run_custom_inference(
-            model=model,
-            image_path=img_path,
-            device=device,
-            imgsz=IMGSZ,
-            conf_thresh=CONF_THRESH,
-            max_det=MAX_DET,
-            nms_thresh=NMS_THRESH,
-        )
-        all_predictions_wcnms.append((pred_boxes, pred_labels, pred_scores))
+        run_display_name = format_run_display_name(run_name)
+        conf_thresh = WCNMS_CONF_THRESH
+        cache_path = build_cache_file_path(detect_run_dir, conf_thresh, IOU_THRESH, IMGSZ, NMS_THRESH)
+        save_plot_path = EVAL_OUTPUT_DIR / f"{run_name}_WC-NMS.png"
+        save_metrics_csv_path = EVAL_OUTPUT_DIR / f"{run_name}_WC-NMS_metrics.csv"
 
-        processed += 1
-        elapsed = time.time() - start_time
-        minutes, seconds = divmod(int(elapsed), 60)
-        print(
-            f"Progress: {processed}/{total_files} ({processed / total_files * 100:.1f}%) "
-            f"Elapsed: {minutes}:{seconds:02d}",
-            end="\r",
-        )
-    print()
+        cached = load_eval_cache(cache_path)
+        if cached is not None:
+            print(f"Using cached WC-NMS evaluation for {run_name} (pre-nms-conf={conf_thresh:.2f})")
+            matrix = cached["matrix"]
+            total_known = cached["total_known"]
+            total_unknown = cached["total_unknown"]
+            per_class_metrics = cached["per_class_metrics"]
+            macro_metrics = cached["macro_metrics"]
+            summary_metrics = cached["summary_metrics"]
+        else:
+            print(f"Running WC-NMS inference on {len(image_paths)} validation images (pre-nms-conf={conf_thresh:.2f})...")
+            model = YOLO(str(model_pt))
+            model.model.eval()
 
-    matrix_before, _, _ = build_confusion_matrix(
-        all_predictions_yolo,
-        valid_label_paths,
-        IMAGES_DIR,
-        IOU_THRESH,
-        VERBOSE,
-    )
-    per_class_before, macro_before, _ = compute_metrics_from_confusion(matrix_before)
+            if DEVICE:
+                model.to(DEVICE)
+                device = next(model.model.parameters()).device
+            else:
+                device = next(model.model.parameters()).device
 
-    print(f"\n{'=' * 70}")
-    print("Before WC-NMS: YOLO")
-    print(f"{'=' * 70}")
-    print_confusion_and_metrics_side_by_side(matrix_before, per_class_before, macro_before)
-    print()
+            total_files = len(image_paths)
+            processed = 0
+            start_time = time.time()
+            all_predictions_wcnms = []
 
-    matrix_after, total_known, total_unknown = build_confusion_matrix(
-        all_predictions_wcnms,
-        valid_label_paths,
-        IMAGES_DIR,
-        IOU_THRESH,
-        VERBOSE,
-    )
+            for img_path in image_paths:
+                pred_boxes, pred_labels, pred_scores = run_custom_inference(
+                    model=model,
+                    image_path=img_path,
+                    device=device,
+                    imgsz=IMGSZ,
+                    conf_thresh=conf_thresh,
+                    max_det=MAX_DET,
+                    nms_thresh=NMS_THRESH,
+                )
+                all_predictions_wcnms.append((pred_boxes, pred_labels, pred_scores))
 
-    per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix_after)
+                processed += 1
+                elapsed = time.time() - start_time
+                minutes, seconds = divmod(int(elapsed), 60)
+                print(
+                    f"Progress: {processed}/{total_files} ({processed / total_files * 100:.2f}%) Elapsed: {minutes}:{seconds:02d}",
+                    end="\r",
+                )
+            print()
 
-    print(f"\n{'=' * 70}")
-    print("After WC-NMS: Weighted-Cluster NMS")
-    print(f"{'=' * 70}")
-    print_confusion_and_metrics_side_by_side(matrix_after, per_class_metrics, macro_metrics)
-    print()
+            matrix, total_known, total_unknown = build_confusion_matrix(
+                all_predictions_wcnms,
+                valid_label_paths,
+                IMAGES_DIR,
+                IOU_THRESH,
+                VERBOSE,
+            )
+            per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
 
-    if SAVE_PLOTS:
-        plot_confusion(matrix_after, save_plot_path)
-        print(f"Saved confusion matrix plot to {save_plot_path}")
+            save_eval_cache(
+                cache_path=cache_path,
+                run_name=run_name,
+                conf_thresh=conf_thresh,
+                iou_thresh=IOU_THRESH,
+                imgsz=IMGSZ,
+                nms_thresh=NMS_THRESH,
+                matrix=matrix,
+                per_class_metrics=per_class_metrics,
+                macro_metrics=macro_metrics,
+                summary_metrics=summary_metrics,
+                total_known=total_known,
+                total_unknown=total_unknown,
+            )
+            print(f"Saved evaluation cache: {cache_path}")
 
-        plot_metrics_table(
-            per_class_metrics=per_class_metrics,
-            macro_metrics=macro_metrics,
-            summary_metrics=summary_metrics,
-            save_path=save_metrics_plot_path,
-        )
-        print(f"Saved metrics table plot to {save_metrics_plot_path}")
+        print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics)
+        print()
+
+        if SAVE_PLOT:
+            if save_plot_path.exists():
+                print(f"Plot already exists, skipping: {save_plot_path.name}")
+            else:
+                plot_confusion(matrix, save_plot_path, run_display_name)
+                print(f"Saved confusion matrix plot to {save_plot_path}")
+
+            if save_metrics_csv_path.exists():
+                print(f"CSV already exists, skipping: {save_metrics_csv_path.name}")
+            else:
+                save_metrics_table_csv(
+                    per_class_metrics=per_class_metrics,
+                    macro_metrics=macro_metrics,
+                    save_path=save_metrics_csv_path,
+                )
+                print(f"Saved metrics table CSV to {save_metrics_csv_path}")
 
 
 if __name__ == "__main__":
