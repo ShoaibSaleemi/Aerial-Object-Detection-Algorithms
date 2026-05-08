@@ -5,7 +5,7 @@ from pathlib import Path
 TOOLS_DIR = Path(__file__).resolve().parents[2] / "tools"
 
 scripts = [
-    ("labels_validation_remap.py", "Remapping validation label IDs for evaluation"),
+    ("labels_validation.py", "Remapping validation label IDs for evaluation"),
     ("labels_validation_check.py", "Checking class IDs in validation labels"),
 ]
 
