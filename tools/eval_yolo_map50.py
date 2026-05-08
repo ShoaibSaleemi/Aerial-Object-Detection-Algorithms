@@ -44,7 +44,7 @@ CONF_INFER = 0.001
 IOU_THRESH = 0.5
 IMGSZ = 640
 
-TARGET_MODELS = {"yolo8n", "yolo9t", "yolo10n", "yolo11n", "yolo12n", "yolo26n"}
+TARGET_MODELS = {"yolo8m"}
 IMAGE_EXTENSIONS = [".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff"]
 
 _INLINE_STATUS_LEN = 0
