@@ -21,9 +21,13 @@ random.seed(0)
 
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
+# Toggle between validation and test dataset
+USE_TEST_DATASET = True  # Set to True to evaluate on test dataset, False for validation
+
 # Edit evaluation parameters here.
-IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
-LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
+DATASET_SPLIT = "test" if USE_TEST_DATASET else "validation"
+IMAGES_DIR = PROJECT_ROOT / "dataset" / DATASET_SPLIT / "images"
+LABELS_DIR = PROJECT_ROOT / "dataset" / DATASET_SPLIT / "labels"
 IOU_THRESH = 0.5
 CONF_THRESH = 0.70
 MODEL_CONF_THRESH = {
@@ -65,11 +69,11 @@ VERBOSE = False  # Print per-image matching/debug details during evaluation when
 EVAL_OUTPUT_DIR = PROJECT_ROOT / "runs" / "eval_yolo"
 
 
-def build_cache_file_path(detect_run_dir: Path, conf_thresh: float, iou_thresh: float, imgsz: int) -> Path:
+def build_cache_file_path(detect_run_dir: Path, conf_thresh: float, iou_thresh: float, imgsz: int, split: str) -> Path:
     cache_dir = detect_run_dir / "eval_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_name = (
-        f"metrics_conf_{conf_thresh:.6f}_iou_{iou_thresh:.2f}_imgsz_{imgsz}.json"
+        f"{split}_metrics_conf_{conf_thresh:.6f}_iou_{iou_thresh:.2f}_imgsz_{imgsz}.json"
         .replace(".", "p")
     )
     return cache_dir / cache_name
@@ -510,7 +514,6 @@ def main():
         detect_run_dir = detect_root_dir / run_name
         model_pt = detect_run_dir / "weights" / "best.pt"
         if not model_pt.exists():
-            print(f"[SKIP] {run_name}: no weights/best.pt found")
             continue
 
         print(f"\n{'=' * 60}")
@@ -519,9 +522,9 @@ def main():
 
         run_display_name = format_run_display_name(run_name)
         conf_thresh = MODEL_CONF_THRESH.get(run_name, CONF_THRESH)
-        cache_path = build_cache_file_path(detect_run_dir, conf_thresh, IOU_THRESH, IMGSZ)
-        save_plot_path = str(EVAL_OUTPUT_DIR / f"{run_name}.png")
-        save_metrics_csv_path = str(EVAL_OUTPUT_DIR / f"{run_name}_metrics.csv")
+        cache_path = build_cache_file_path(detect_run_dir, conf_thresh, IOU_THRESH, IMGSZ, DATASET_SPLIT)
+        save_plot_path = EVAL_OUTPUT_DIR / f"{run_name}_{DATASET_SPLIT}.png"
+        save_metrics_csv_path = EVAL_OUTPUT_DIR / f"{run_name}_{DATASET_SPLIT}_metrics.csv"
         EVAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
         cached = load_eval_cache(cache_path)
@@ -534,7 +537,7 @@ def main():
             macro_metrics = cached["macro_metrics"]
             summary_metrics = cached["summary_metrics"]
         else:
-            print(f"Running inference on {len(image_paths)} validation images (conf={conf_thresh:.4f})...")
+            print(f"Running inference on {len(image_paths)} {DATASET_SPLIT} images (conf={conf_thresh:.4f})...")
             model = YOLO(str(model_pt))
             total_files = len(image_paths)
             processed = 0
