@@ -21,9 +21,13 @@ random.seed(0)
 
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
+# Toggle between validation and test dataset
+USE_TEST_DATASET = True  # Set to True to evaluate on test dataset, False for validation
+
 # Edit evaluation parameters here.
-IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
-LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
+DATASET_SPLIT = "test" if USE_TEST_DATASET else "validation"
+IMAGES_DIR = PROJECT_ROOT / "dataset" / DATASET_SPLIT / "images"
+LABELS_DIR = PROJECT_ROOT / "dataset" / DATASET_SPLIT / "labels"
 IOU_THRESH = 0.5
 CONF_THRESH = 0.70
 MODEL_CONF_THRESH = {
@@ -65,11 +69,11 @@ VERBOSE = False  # Print per-image matching/debug details during evaluation when
 EVAL_OUTPUT_DIR = PROJECT_ROOT / "runs" / "eval_yolo"
 
 
-def build_cache_file_path(detect_run_dir: Path, conf_thresh: float, iou_thresh: float, imgsz: int) -> Path:
+def build_cache_file_path(detect_run_dir: Path, conf_thresh: float, iou_thresh: float, imgsz: int, split: str) -> Path:
     cache_dir = detect_run_dir / "eval_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_name = (
-        f"metrics_conf_{conf_thresh:.6f}_iou_{iou_thresh:.2f}_imgsz_{imgsz}.json"
+        f"{split}_metrics_conf_{conf_thresh:.6f}_iou_{iou_thresh:.2f}_imgsz_{imgsz}.json"
         .replace(".", "p")
     )
     return cache_dir / cache_name
@@ -460,10 +464,12 @@ def save_metrics_table_csv(per_class_metrics, macro_metrics, save_path):
 
 def main():
     detect_root_dir = PROJECT_ROOT / "runs" / "detect"
-    available_runs = sorted([path.name for path in detect_root_dir.iterdir() if path.is_dir()])
+    available_runs = [path.name for path in detect_root_dir.iterdir() if path.is_dir()]
 
     if len(available_runs) == 0:
         raise ValueError(f"No folders found in {detect_root_dir}")
+
+    MODEL_ORDER = ["yolo8n", "yolo8m", "yolo9t", "yolo10n", "yolo11n", "yolo12n", "yolo26n"]
 
     if len(sys.argv) > 1:
         run_names = [sys.argv[1]]
@@ -473,9 +479,12 @@ def main():
                 f"Unknown folder '{run_names[0]}'. Choose one from runs/detect: {available_text}"
             )
     elif RUN_ALL_MODELS:
-        run_names = available_runs
+        run_names = [r for r in MODEL_ORDER if r in available_runs] + \
+                    [r for r in sorted(available_runs) if r not in MODEL_ORDER]
     else:
-        run_names = [name for name in available_runs if ENABLED_MODELS.get(name, False)]
+        ordered = [r for r in MODEL_ORDER if r in available_runs and ENABLED_MODELS.get(r, False)]
+        extras = [r for r in sorted(available_runs) if r not in MODEL_ORDER and ENABLED_MODELS.get(r, False)]
+        run_names = ordered + extras
         if not run_names:
             raise ValueError("No models enabled. Set RUN_ALL_MODELS=True or enable at least one in ENABLED_MODELS.")
 
@@ -506,11 +515,12 @@ def main():
     if len(image_paths) == 0:
         raise ValueError(f"No validation images found in {IMAGES_DIR}")
 
+    all_model_rows = []  # Accumulates rows for the combined summary CSV
+
     for run_name in run_names:
         detect_run_dir = detect_root_dir / run_name
         model_pt = detect_run_dir / "weights" / "best.pt"
         if not model_pt.exists():
-            print(f"[SKIP] {run_name}: no weights/best.pt found")
             continue
 
         print(f"\n{'=' * 60}")
@@ -519,9 +529,9 @@ def main():
 
         run_display_name = format_run_display_name(run_name)
         conf_thresh = MODEL_CONF_THRESH.get(run_name, CONF_THRESH)
-        cache_path = build_cache_file_path(detect_run_dir, conf_thresh, IOU_THRESH, IMGSZ)
-        save_plot_path = str(EVAL_OUTPUT_DIR / f"{run_name}.png")
-        save_metrics_csv_path = str(EVAL_OUTPUT_DIR / f"{run_name}_metrics.csv")
+        cache_path = build_cache_file_path(detect_run_dir, conf_thresh, IOU_THRESH, IMGSZ, DATASET_SPLIT)
+        save_plot_path = EVAL_OUTPUT_DIR / f"{run_name}.png"
+        save_metrics_csv_path = EVAL_OUTPUT_DIR / f"{run_name}_metrics.csv"
         EVAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
         cached = load_eval_cache(cache_path)
@@ -534,7 +544,7 @@ def main():
             macro_metrics = cached["macro_metrics"]
             summary_metrics = cached["summary_metrics"]
         else:
-            print(f"Running inference on {len(image_paths)} validation images (conf={conf_thresh:.4f})...")
+            print(f"Running inference on {len(image_paths)} {DATASET_SPLIT} images (conf={conf_thresh:.4f})...")
             model = YOLO(str(model_pt))
             total_files = len(image_paths)
             processed = 0
@@ -581,6 +591,23 @@ def main():
         print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics)
         print()
 
+        # Accumulate rows for combined summary CSV
+        for m in per_class_metrics:
+            all_model_rows.append([
+                run_display_name,
+                m["class"],
+                f"{m['Precision'] * 100:.2f}".replace('.', ',') if not np.isnan(m["Precision"]) else "nan",
+                f"{m['Recall'] * 100:.2f}".replace('.', ',') if not np.isnan(m["Recall"]) else "nan",
+                f"{m['F1-score'] * 100:.2f}".replace('.', ',') if not np.isnan(m["F1-score"]) else "nan",
+            ])
+        all_model_rows.append([
+            run_display_name,
+            "average",
+            f"{macro_metrics['Precision'] * 100:.2f}".replace('.', ',') if not np.isnan(macro_metrics["Precision"]) else "nan",
+            f"{macro_metrics['Recall'] * 100:.2f}".replace('.', ',') if not np.isnan(macro_metrics["Recall"]) else "nan",
+            f"{macro_metrics['F1-score'] * 100:.2f}".replace('.', ',') if not np.isnan(macro_metrics["F1-score"]) else "nan",
+        ])
+
         if SAVE_PLOT:
             if save_plot_path.exists():
                 print(f"Plot already exists, skipping: {save_plot_path.name}")
@@ -588,15 +615,25 @@ def main():
                 plot_confusion(matrix, save_plot_path, run_display_name)
                 print(f"Saved confusion matrix plot to {save_plot_path}")
 
-            if save_metrics_csv_path.exists():
-                print(f"CSV already exists, skipping: {save_metrics_csv_path.name}")
-            else:
-                save_metrics_table_csv(
-                    per_class_metrics=per_class_metrics,
-                    macro_metrics=macro_metrics,
-                    save_path=save_metrics_csv_path,
-                )
-                print(f"Saved metrics table CSV to {save_metrics_csv_path}")
+    # Save combined summary CSV for all models
+    if all_model_rows:
+        combined_csv_path = EVAL_OUTPUT_DIR / "all_models_metrics.csv"
+        # Preserve any existing rows from models not in this run (e.g. Faster R-CNN)
+        yolo_model_names = {row[0] for row in all_model_rows}
+        preserved_rows = []
+        if combined_csv_path.exists():
+            with combined_csv_path.open("r", newline="", encoding="utf-8") as csv_file:
+                reader = csv.reader(csv_file)
+                next(reader, None)  # skip header
+                for row in reader:
+                    if row and row[0] not in yolo_model_names:
+                        preserved_rows.append(row)
+        with combined_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["Model", "Class", "Precision", "Recall", "F1"])
+            writer.writerows(all_model_rows)
+            writer.writerows(preserved_rows)
+        print(f"\nSaved combined metrics CSV to {combined_csv_path}")
 
 
 if __name__ == "__main__":

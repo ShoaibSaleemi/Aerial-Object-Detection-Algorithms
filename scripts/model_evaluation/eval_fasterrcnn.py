@@ -1,3 +1,4 @@
+import csv
 from itertools import zip_longest
 from pathlib import Path
 import json
@@ -23,11 +24,15 @@ random.seed(0)
 # prediction outside the known label set is folded into `unknown` for metrics.
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
+# Toggle between validation and test dataset
+USE_TEST_DATASET = True  # Set to True to evaluate on test dataset, False for validation
+DATASET_SPLIT = "test" if USE_TEST_DATASET else "validation"
+
 # Edit these parameters directly before running this script.
 CONFIG = {
     "model": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "fasterrcnn_epoch_50.pt"),
-    "images": str(PROJECT_ROOT / "dataset" / "validation" / "images"),
-    "labels": str(PROJECT_ROOT / "dataset" / "validation" / "labels"),
+    "images": str(PROJECT_ROOT / "dataset" / DATASET_SPLIT / "images"),
+    "labels": str(PROJECT_ROOT / "dataset" / DATASET_SPLIT / "labels"),
     "iou_thresh": 0.5,
     "conf_thresh": 0.996286,
     "save_plot": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "fasterrcnn.png"),
@@ -43,11 +48,11 @@ CELL_VALUE_FONTSIZE = 33
 PREDICTED_LABEL_PAD = -14   # Distance (points) between "Predicted" label and the matrix; decrease to move closer.
 
 
-def build_cache_file_path(run_dir: Path, conf_thresh: float, iou_thresh: float) -> Path:
+def build_cache_file_path(run_dir: Path, conf_thresh: float, iou_thresh: float, split: str) -> Path:
     cache_dir = run_dir / "eval_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_name = (
-        f"metrics_conf_{conf_thresh:.6f}_iou_{iou_thresh:.2f}.json"
+        f"{split}_metrics_conf_{conf_thresh:.6f}_iou_{iou_thresh:.2f}.json"
         .replace(".", "p")
     )
     return cache_dir / cache_name
@@ -524,7 +529,7 @@ def main():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     model_display_name = format_model_display_name(checkpoint_path)
     run_dir = checkpoint_path.parent
-    cache_path = build_cache_file_path(run_dir, conf_thresh, iou_thresh)
+    cache_path = build_cache_file_path(run_dir, conf_thresh, iou_thresh, DATASET_SPLIT)
     save_plot_path = save_plot
     save_metrics_plot_path = save_metrics_plot
 
@@ -552,7 +557,7 @@ def main():
             valid_label_paths.append(label_path)
 
     if len(image_paths) == 0:
-        raise ValueError(f"No validation images found in {images_dir}")
+        raise ValueError(f"No {DATASET_SPLIT} images found in {images_dir}")
 
     cached = load_eval_cache(cache_path)
     if cached is not None:
@@ -565,7 +570,7 @@ def main():
         print(f"Loading model from {checkpoint_path}...")
         model = build_model(checkpoint_path, device=device)
 
-        print(f"Running inference on {len(image_paths)} validation images (conf={conf_thresh:.4f})...")
+        print(f"Running inference on {len(image_paths)} {DATASET_SPLIT} images (conf={conf_thresh:.4f})...")
 
         matrix, _, _ = build_confusion_matrix(
             model,
@@ -605,6 +610,44 @@ def main():
             title_prefix=model_display_name,
         )
         print(f"Saved metrics table plot to {save_metrics_plot_path}")
+
+    # Append Faster R-CNN results to the shared all_models_metrics.csv
+    combined_csv_path = PROJECT_ROOT / "runs" / "eval_yolo" / "all_models_metrics.csv"
+    frcnn_rows = []
+    for m in per_class_metrics:
+        frcnn_rows.append([
+            model_display_name,
+            m["class"],
+            f"{m['Precision'] * 100:.2f}".replace('.', ',') if not np.isnan(m["Precision"]) else "nan",
+            f"{m['Recall'] * 100:.2f}".replace('.', ',') if not np.isnan(m["Recall"]) else "nan",
+            f"{m['F1-score'] * 100:.2f}".replace('.', ',') if not np.isnan(m["F1-score"]) else "nan",
+        ])
+    frcnn_rows.append([
+        model_display_name,
+        "average",
+        f"{macro_metrics['Precision'] * 100:.2f}".replace('.', ',') if not np.isnan(macro_metrics["Precision"]) else "nan",
+        f"{macro_metrics['Recall'] * 100:.2f}".replace('.', ',') if not np.isnan(macro_metrics["Recall"]) else "nan",
+        f"{macro_metrics['F1-score'] * 100:.2f}".replace('.', ',') if not np.isnan(macro_metrics["F1-score"]) else "nan",
+    ])
+    combined_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Read existing rows and remove any previous Faster R-CNN entries
+    existing_rows = []
+    if combined_csv_path.exists():
+        with combined_csv_path.open("r", newline="", encoding="utf-8") as csv_file:
+            reader = csv.reader(csv_file)
+            next(reader, None)  # skip header
+            for row in reader:
+                if row and row[0] != model_display_name:
+                    existing_rows.append(row)
+    
+    # Write back all rows: existing (non-Faster R-CNN) + new Faster R-CNN
+    with combined_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["Model", "Class", "Precision", "Recall", "F1"])
+        writer.writerows(existing_rows)
+        writer.writerows(frcnn_rows)
+    print(f"Updated Faster R-CNN results in {combined_csv_path}")
 
 
 if __name__ == "__main__":
