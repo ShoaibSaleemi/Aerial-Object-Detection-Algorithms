@@ -177,7 +177,7 @@ def main():
     frame_ious:     list[float] = []
     frame_dists:    list[float] = []
     frame_confs:    list[float] = []
-    frame_detected: list[int]   = []
+    frame_cls_ids:  list[int]   = []  # class ID of best-matching box per exist=1 frame (-1 = none)
     frame_numbers:  list[int]   = []
     covered_frames: int = 0
     exist1_frames:  int = 0
@@ -227,13 +227,13 @@ def main():
                 best_iou  = 0.0
                 best_dist = float("nan")
                 best_conf = 0.0
-                detected  = 0
+                best_cls  = -1
                 if hasattr(r, "boxes") and len(r.boxes) > 0:
                     covered_frames += 1
-                    detected = 1
-                    for box, conf in zip(
+                    for box, conf, cls_id in zip(
                         r.boxes.xyxy.cpu().numpy(),
                         r.boxes.conf.cpu().numpy(),
+                        r.boxes.cls.cpu().numpy(),
                     ):
                         iou_val = _iou(box.tolist(), gt_xyxy)
                         if iou_val > best_iou:
@@ -241,13 +241,14 @@ def main():
                             tcx = (box[0] + box[2]) / 2.0
                             tcy = (box[1] + box[3]) / 2.0
                             best_dist = float(np.hypot(tcx - gt_cx, tcy - gt_cy))
+                            best_cls  = int(cls_id) if int(cls_id) < 3 else 2
                         if float(conf) > best_conf:
                             best_conf = float(conf)
 
                 frame_ious.append(best_iou)
                 frame_dists.append(best_dist)
                 frame_confs.append(best_conf)
-                frame_detected.append(detected)
+                frame_cls_ids.append(best_cls)
                 frame_numbers.append(processed + 1)
 
         writer.write(frame)
@@ -330,10 +331,10 @@ def main():
         # ── Per-frame metrics plot ──────────────────────────────────────────
         frames_x = np.array(frame_numbers, dtype=np.float32)
         metrics = [
-            ("IoU",                     np.array(frame_ious,     dtype=np.float32), (0.0, 1.0)),
-            ("Center distance (px)",    np.array(frame_dists,    dtype=np.float32), None),
-            ("Detection confidence",    np.array(frame_confs,    dtype=np.float32), (0.0, 1.0)),
-            ("Detected (0/1)",          np.array(frame_detected, dtype=np.float32), (-0.1, 1.1)),
+            ("IoU",                     np.array(frame_ious,    dtype=np.float32), (0.0, 1.0)),
+            ("Center distance (px)",    np.array(frame_dists,   dtype=np.float32), None),
+            ("Detection confidence",    np.array(frame_confs,   dtype=np.float32), (0.0, 1.0)),
+            ("Class ID",                np.array(frame_cls_ids, dtype=np.float32), (-1.5, 2.5)),
         ]
 
         fig2, axes = plt.subplots(
@@ -349,6 +350,11 @@ def main():
             if ylim is not None:
                 ax.set_ylim(*ylim)
             ax.grid(True, alpha=0.35)
+
+        # Class ID axis: integer ticks with class name labels (-1 = none)
+        cls_ax = axes[-1]
+        cls_ax.set_yticks([-1, 0, 1, 2])
+        cls_ax.set_yticklabels(["none", "bird", "drone", "unknown"], fontsize=8)
 
         axes[-1].set_xlabel("Frame", fontsize=10)
         fig2.tight_layout()

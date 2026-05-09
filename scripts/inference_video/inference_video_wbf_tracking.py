@@ -31,7 +31,10 @@ import numpy as np
 import questionary
 import torch
 import torch.nn as nn
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from ultralytics import YOLO
+from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -49,6 +52,7 @@ MODEL_CONF_THRESH = {
     "yolo11n": 0.712997868833143,
     "yolo12n": 0.6838702654977842,
     "yolo26n": 0.6052508580184951,
+    "fasterrcnn": 0.9891891891891892,
 }
 CONF_THRESH = 0.70  # fallback if model not in MODEL_CONF_THRESH
 
@@ -68,13 +72,14 @@ DISAGREEMENT_RATIO_THRESH = 0.15223066760019896
 # ── Model selection ───────────────────────────────────────────────────────────
 # Set True to include a model in the ensemble, False to skip it.
 ENABLED_MODELS = {
-    "yolo8n":  True,
-    "yolo8m":  False,
+    "yolo8n":  False,
+    "yolo8m":  True,
     "yolo9t":  False,
     "yolo10n": False,
     "yolo11n": True,
     "yolo12n": False,
     "yolo26n": True,
+    "fasterrcnn": False,
 }
 
 # Ensemble model list: (name, path_to_weights)
@@ -86,6 +91,7 @@ MODELS = [
     ("yolo11n", PROJECT_ROOT / "runs" / "detect" / "yolo11n" / "weights" / "best.pt"),
     ("yolo12n", PROJECT_ROOT / "runs" / "detect" / "yolo12n" / "weights" / "best.pt"),
     ("yolo26n", PROJECT_ROOT / "runs" / "detect" / "yolo26n" / "weights" / "best.pt"),
+    ("fasterrcnn", PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "fasterrcnn_epoch_50.pt"),
 ]
 
 # Per-model per-class weighting for WBF (tuned via Bayesian optimisation on 6-model ensemble).
@@ -97,14 +103,70 @@ MODEL_WEIGHTS = {
     "yolo11n": {"bird": 1.3215138210731259, "drone": 1.9403016932408828, "unknown": 1.338899849846067},
     "yolo12n": {"bird": 0.8035608928262429, "drone": 1.3438739986019623, "unknown": 1.3166024543945136},
     "yolo26n": {"bird": 1.3364625610235248, "drone": 1.1804482074749882, "unknown": 1.746577505269269},
+    "fasterrcnn": {"bird": 1.0, "drone": 1.0, "unknown": 1.0},
 }
 
 # ── Tracking parameters ───────────────────────────────────────────────────────
-MAX_LOST   = 10   # frames to keep a lost track alive
-MIN_HITS   = 2    # frames before a new track is drawn
+MAX_LOST         = 10    # frames to keep a lost track alive
+MIN_HITS         = 2     # frames before a new track is drawn
 IOU_THRESH_TRACK = 0.30  # greedy matching IoU threshold
-SEQ_LEN    = 8    # LSTM history window (frames)
-TRAIL_LEN  = 30   # trail length in frames
+SEQ_LEN          = 8     # LSTM history window (frames)
+TRAIL_LEN        = 30    # trail length in frames
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Faster R-CNN wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+class _FasterRCNNBoxes:
+    def __init__(self, xyxy, cls, conf):
+        self.xyxy = xyxy
+        self.cls  = cls
+        self.conf = conf
+    def __len__(self):
+        return self.xyxy.shape[0]
+
+
+class _FasterRCNNResult:
+    def __init__(self, boxes):
+        self.boxes = boxes
+
+
+class FasterRCNNWrapper:
+    """Wraps a torchvision Faster R-CNN to match the Ultralytics .predict() interface.
+    Accepts either a BGR numpy frame (from OpenCV) or a file path string.
+    """
+
+    def __init__(self, model, device):
+        self.model  = model
+        self.device = device
+
+    def predict(self, source, conf, imgsz=None, device=None, verbose=False, **kwargs):
+        if isinstance(source, np.ndarray):
+            # BGR numpy frame → RGB tensor
+            rgb = source[:, :, ::-1]
+            img_tensor = (
+                torch.from_numpy(np.ascontiguousarray(rgb, dtype="uint8"))
+                .permute(2, 0, 1)
+                .float() / 255.0
+            ).to(self.device)
+        else:
+            img = Image.open(source).convert("RGB")
+            img_tensor = (
+                torch.from_numpy(np.array(img, dtype="uint8"))
+                .permute(2, 0, 1)
+                .float() / 255.0
+            ).to(self.device)
+
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model([img_tensor])
+
+        output = outputs[0]
+        boxes  = output["boxes"].cpu()
+        labels = output["labels"].float().cpu()
+        scores = output["scores"].cpu()
+
+        mask = scores >= conf
+        return [_FasterRCNNResult(_FasterRCNNBoxes(boxes[mask], labels[mask], scores[mask]))]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -537,20 +599,47 @@ def main():
 
     # Load ensemble models
     print("Loading ensemble models...")
-    loaded_models: list[tuple[str, YOLO, dict]] = []
+    loaded_models: list[tuple[str, object, dict]] = []
     for model_name, model_path in MODELS:
         if not ENABLED_MODELS.get(model_name, False):
             continue
         if not model_path.exists():
             print(f"  [SKIP] {model_name}: not found at {model_path}")
             continue
-        model     = YOLO(str(model_path))
-        class_map = build_model_class_map(model)
+        if model_name == "fasterrcnn":
+            _frcnn_device = torch.device(
+                "cuda" if torch.cuda.is_available() and DEVICE != "cpu" else "cpu"
+            )
+            _ckpt = torch.load(str(model_path), map_location=_frcnn_device, weights_only=False)
+            _num_classes = _ckpt["model_state_dict"][
+                "roi_heads.box_predictor.cls_score.weight"
+            ].shape[0]
+            _frcnn = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None)
+            _in_features = _frcnn.roi_heads.box_predictor.cls_score.in_features
+            _frcnn.roi_heads.box_predictor = FastRCNNPredictor(_in_features, _num_classes)
+            _frcnn.load_state_dict(_ckpt["model_state_dict"])
+            _frcnn.to(_frcnn_device).eval()
+            model     = FasterRCNNWrapper(_frcnn, _frcnn_device)
+            class_map = {1: "bird", 2: "drone", 3: "unknown"}
+        else:
+            model     = YOLO(str(model_path))
+            class_map = build_model_class_map(model)
         loaded_models.append((model_name, model, class_map))
         print(f"  [OK]   {model_name}")
 
     if not loaded_models:
         raise ValueError("No ensemble models were loaded. Check MODELS paths.")
+
+    global MIN_MODEL_SUPPORT
+    majority = (len(loaded_models) + 1) // 2  # ceil(n/2)
+    if MIN_MODEL_SUPPORT > len(loaded_models) or MIN_MODEL_SUPPORT > majority:
+        new_val = min(MIN_MODEL_SUPPORT, majority)
+        new_val = max(1, new_val)
+        print(
+            f"  [NOTE] MIN_MODEL_SUPPORT adjusted from {MIN_MODEL_SUPPORT} "
+            f"→ majority threshold {majority} for {len(loaded_models)} loaded models."
+        )
+        MIN_MODEL_SUPPORT = majority
 
     tracker = MultiObjectTracker(lstm_device=lstm_device)
 
@@ -588,7 +677,7 @@ def main():
     frame_ious:     list[float] = []  # IoU vs GT per exist=1 frame
     frame_dists:    list[float] = []  # centre distance per exist=1 frame
     frame_confs:    list[float] = []  # best track confidence per exist=1 frame
-    frame_detected: list[int]   = []  # 1 if ≥1 track present, else 0
+    frame_cls_ids:  list[int]   = []  # class ID of best-matching track per exist=1 frame (-1 = none)
     frame_numbers:  list[int]   = []  # 1-based frame index
     covered_frames: int = 0           # exist=1 frames where ≥1 track present
     exist1_frames:  int = 0           # total exist=1 frames seen
@@ -630,7 +719,7 @@ def main():
                 best_iou  = 0.0
                 best_dist = float("nan")
                 best_conf = 0.0
-                detected  = 0
+                best_cls  = -1
                 for box_xyxy, _tid, _cls, _conf, _lstm in track_results:
                     iou_val = _iou(box_xyxy, gt_xyxy)
                     if iou_val > best_iou:
@@ -638,17 +727,17 @@ def main():
                         tcx = (box_xyxy[0] + box_xyxy[2]) / 2.0
                         tcy = (box_xyxy[1] + box_xyxy[3]) / 2.0
                         best_dist = float(np.hypot(tcx - gt_cx, tcy - gt_cy))
+                        best_cls  = int(_cls)
                     if float(_conf) > best_conf:
                         best_conf = float(_conf)
 
                 if track_results:
                     covered_frames += 1
-                    detected = 1
 
                 frame_ious.append(best_iou)
                 frame_dists.append(best_dist)
                 frame_confs.append(best_conf)
-                frame_detected.append(detected)
+                frame_cls_ids.append(best_cls)
                 frame_numbers.append(processed + 1)
 
         writer.write(frame)
@@ -732,10 +821,10 @@ def main():
         # ── Per-frame metrics plot ──────────────────────────────────────────
         frames_x = np.array(frame_numbers, dtype=np.float32)
         metrics = [
-            ("IoU",                     np.array(frame_ious,     dtype=np.float32), (0.0, 1.0)),
-            ("Center distance (px)",    np.array(frame_dists,    dtype=np.float32), None),
-            ("Detection confidence",    np.array(frame_confs,    dtype=np.float32), (0.0, 1.0)),
-            ("Detected (0/1)",          np.array(frame_detected, dtype=np.float32), (-0.1, 1.1)),
+            ("IoU",                     np.array(frame_ious,    dtype=np.float32), (0.0, 1.0)),
+            ("Center distance (px)",    np.array(frame_dists,   dtype=np.float32), None),
+            ("Detection confidence",    np.array(frame_confs,   dtype=np.float32), (0.0, 1.0)),
+            ("Class ID",                np.array(frame_cls_ids, dtype=np.float32), (-1.5, 2.5)),
         ]
 
         fig2, axes = plt.subplots(
@@ -751,6 +840,11 @@ def main():
             if ylim is not None:
                 ax.set_ylim(*ylim)
             ax.grid(True, alpha=0.35)
+
+        # Class ID axis: integer ticks with class name labels (-1 = none)
+        cls_ax = axes[-1]
+        cls_ax.set_yticks([-1, 0, 1, 2])
+        cls_ax.set_yticklabels(["none", "bird", "drone", "unknown"], fontsize=8)
 
         axes[-1].set_xlabel("Frame", fontsize=10)
         fig2.tight_layout()
