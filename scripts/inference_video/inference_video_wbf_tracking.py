@@ -37,9 +37,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 CLASS_NAMES = ["bird", "drone", "unknown"]
 VIDEO_DIR   = PROJECT_ROOT / "dataset" / "test" / "videos"
-CONF_THRESH = 0.7           # per-model detection threshold before fusion
 IMG_SIZE    = 640
 DEVICE      = ""             # "cpu", "0", etc.; empty = auto
+
+# Per-model confidence thresholds (tuned on validation set).
+MODEL_CONF_THRESH = {
+    "yolo8n":  0.6863484706628682,
+    "yolo8m":  0.7133918823950539,
+    "yolo9t":  0.6724046133517759,
+    "yolo10n": 0.5910035105688879,
+    "yolo11n": 0.712997868833143,
+    "yolo12n": 0.6838702654977842,
+    "yolo26n": 0.6052508580184951,
+}
+CONF_THRESH = 0.70  # fallback if model not in MODEL_CONF_THRESH
 
 COLORS = {
     "bird":    (0, 255, 0),      # green
@@ -49,23 +60,43 @@ COLORS = {
 
 # ── WBF parameters ────────────────────────────────────────────────────────────
 FUSION_IOU_THRESH       = 0.50
-MIN_MODEL_SUPPORT       = 3
-KNOWN_FUSED_CONF_THRESH = 0.55
-SCORE_MARGIN_THRESH     = 0.20
-DISAGREEMENT_RATIO_THRESH = 0.55
+MIN_MODEL_SUPPORT       = 5
+KNOWN_FUSED_CONF_THRESH = 0.68770202403814
+SCORE_MARGIN_THRESH     = 0.5582857958051067
+DISAGREEMENT_RATIO_THRESH = 0.15223066760019896
+
+# ── Model selection ───────────────────────────────────────────────────────────
+# Set True to include a model in the ensemble, False to skip it.
+ENABLED_MODELS = {
+    "yolo8n":  True,
+    "yolo8m":  False,
+    "yolo9t":  False,
+    "yolo10n": False,
+    "yolo11n": True,
+    "yolo12n": False,
+    "yolo26n": True,
+}
 
 # Ensemble model list: (name, path_to_weights)
 MODELS = [
     ("yolo8n",  PROJECT_ROOT / "runs" / "detect" / "yolo8n"  / "weights" / "best.pt"),
+    ("yolo8m",  PROJECT_ROOT / "runs" / "detect" / "yolo8m"  / "weights" / "best.pt"),
     ("yolo9t",  PROJECT_ROOT / "runs" / "detect" / "yolo9t"  / "weights" / "best.pt"),
     ("yolo10n", PROJECT_ROOT / "runs" / "detect" / "yolo10n" / "weights" / "best.pt"),
+    ("yolo11n", PROJECT_ROOT / "runs" / "detect" / "yolo11n" / "weights" / "best.pt"),
+    ("yolo12n", PROJECT_ROOT / "runs" / "detect" / "yolo12n" / "weights" / "best.pt"),
+    ("yolo26n", PROJECT_ROOT / "runs" / "detect" / "yolo26n" / "weights" / "best.pt"),
 ]
 
-# Per-model per-class weighting for WBF.
+# Per-model per-class weighting for WBF (tuned via Bayesian optimisation on 6-model ensemble).
 MODEL_WEIGHTS = {
-    "yolo8n":  {"bird": 1.000, "drone": 1.000, "unknown": 1.000},
-    "yolo9t":  {"bird": 1.000, "drone": 1.000, "unknown": 1.000},
-    "yolo10n": {"bird": 1.000, "drone": 1.000, "unknown": 1.000},
+    "yolo8n":  {"bird": 1.0173818474125131, "drone": 1.3684375247874139, "unknown": 1.1646555286393707},
+    "yolo8m":  {"bird": 1.000,              "drone": 1.000,              "unknown": 1.000},
+    "yolo9t":  {"bird": 1.3345783180967155, "drone": 1.3246461700191348, "unknown": 1.4472517946232146},
+    "yolo10n": {"bird": 0.701091472694561,  "drone": 0.9099028240616815, "unknown": 0.718502456356537},
+    "yolo11n": {"bird": 1.3215138210731259, "drone": 1.9403016932408828, "unknown": 1.338899849846067},
+    "yolo12n": {"bird": 0.8035608928262429, "drone": 1.3438739986019623, "unknown": 1.3166024543945136},
+    "yolo26n": {"bird": 1.3364625610235248, "drone": 1.1804482074749882, "unknown": 1.746577505269269},
 }
 
 # ── Tracking parameters ───────────────────────────────────────────────────────
@@ -171,7 +202,7 @@ def run_wbf_on_frame(loaded_models: list, frame: np.ndarray) -> list[dict]:
     for model_name, model, class_map in loaded_models:
         predict_kwargs = {
             "source": frame,
-            "conf":   CONF_THRESH,
+            "conf":   MODEL_CONF_THRESH.get(model_name, CONF_THRESH),
             "imgsz":  IMG_SIZE,
             "save":   False,
             "show":   False,
@@ -508,6 +539,8 @@ def main():
     print("Loading ensemble models...")
     loaded_models: list[tuple[str, YOLO, dict]] = []
     for model_name, model_path in MODELS:
+        if not ENABLED_MODELS.get(model_name, False):
+            continue
         if not model_path.exists():
             print(f"  [SKIP] {model_name}: not found at {model_path}")
             continue
@@ -554,6 +587,9 @@ def main():
     # Per-frame evaluation accumulators
     frame_ious:     list[float] = []  # IoU vs GT per exist=1 frame
     frame_dists:    list[float] = []  # centre distance per exist=1 frame
+    frame_confs:    list[float] = []  # best track confidence per exist=1 frame
+    frame_detected: list[int]   = []  # 1 if ≥1 track present, else 0
+    frame_numbers:  list[int]   = []  # 1-based frame index
     covered_frames: int = 0           # exist=1 frames where ≥1 track present
     exist1_frames:  int = 0           # total exist=1 frames seen
 
@@ -592,7 +628,9 @@ def main():
                 exist1_frames += 1
 
                 best_iou  = 0.0
-                best_dist = float("inf")
+                best_dist = float("nan")
+                best_conf = 0.0
+                detected  = 0
                 for box_xyxy, _tid, _cls, _conf, _lstm in track_results:
                     iou_val = _iou(box_xyxy, gt_xyxy)
                     if iou_val > best_iou:
@@ -600,11 +638,18 @@ def main():
                         tcx = (box_xyxy[0] + box_xyxy[2]) / 2.0
                         tcy = (box_xyxy[1] + box_xyxy[3]) / 2.0
                         best_dist = float(np.hypot(tcx - gt_cx, tcy - gt_cy))
+                    if float(_conf) > best_conf:
+                        best_conf = float(_conf)
+
+                if track_results:
+                    covered_frames += 1
+                    detected = 1
 
                 frame_ious.append(best_iou)
                 frame_dists.append(best_dist)
-                if track_results:
-                    covered_frames += 1
+                frame_confs.append(best_conf)
+                frame_detected.append(detected)
+                frame_numbers.append(processed + 1)
 
         writer.write(frame)
 
@@ -683,6 +728,36 @@ def main():
         fig.savefig(str(plot_path), dpi=120)
         plt.close(fig)
         print(f"\n  Eval plot → {plot_path}")
+
+        # ── Per-frame metrics plot ──────────────────────────────────────────
+        frames_x = np.array(frame_numbers, dtype=np.float32)
+        metrics = [
+            ("IoU",                     np.array(frame_ious,     dtype=np.float32), (0.0, 1.0)),
+            ("Center distance (px)",    np.array(frame_dists,    dtype=np.float32), None),
+            ("Detection confidence",    np.array(frame_confs,    dtype=np.float32), (0.0, 1.0)),
+            ("Detected (0/1)",          np.array(frame_detected, dtype=np.float32), (-0.1, 1.1)),
+        ]
+
+        fig2, axes = plt.subplots(
+            len(metrics), 1,
+            figsize=(12, 3 * len(metrics)),
+            sharex=True,
+        )
+        fig2.suptitle("WBF tracking  —  per-frame metrics", fontsize=13, fontweight="bold")
+
+        for ax, (label, values, ylim) in zip(axes, metrics):
+            ax.plot(frames_x, values, linewidth=1.0)
+            ax.set_ylabel(label, fontsize=10)
+            if ylim is not None:
+                ax.set_ylim(*ylim)
+            ax.grid(True, alpha=0.35)
+
+        axes[-1].set_xlabel("Frame", fontsize=10)
+        fig2.tight_layout()
+        perframe_plot_path = output_dir / f"{video_path.stem}_wbf_perframe.png"
+        fig2.savefig(str(perframe_plot_path), dpi=120)
+        plt.close(fig2)
+        print(f"  Per-frame plot → {perframe_plot_path}")
 
         csv_path = output_dir / f"{video_path.stem}_wbf_eval.csv"
         with open(csv_path, "w", newline="", encoding="utf-8") as f:

@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 import torch
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from ultralytics import YOLO
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -20,30 +22,53 @@ random.seed(0)
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
 # Edit evaluation parameters here.
-IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
-LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
+IMAGES_DIR = PROJECT_ROOT / "dataset" / "test" / "images"
+LABELS_DIR = PROJECT_ROOT / "dataset" / "test" / "labels"
 IOU_THRESH = 0.5
 CONF_THRESH = 0.70
 MODEL_CONF_THRESH = {
+    "yolo8n":  0.6863484706628682,
+    "yolo8m":  0.7133918823950539,
     "yolo9t":  0.6724046133517759,
+    "yolo10n": 0.5910035105688879,
     "yolo11n": 0.712997868833143,
-    "yolo26n": 0.6052508580184951
+    "yolo12n": 0.6838702654977842,
+    "yolo26n": 0.6052508580184951,
+    "fasterrcnn": 0.9891891891891892,
 }
+
+# Enable/disable models in the ensemble
+ENABLED_MODELS = {
+    "yolo8n": True,
+    "yolo8m": False,
+    "yolo9t": False,
+    "yolo10n": False,
+    "yolo11n": False,
+    "yolo12n": False,
+    "yolo26n": True,
+    "fasterrcnn": True,
+}
+
 FUSION_IOU_THRESH = 0.50
 IMGSZ = 640
 DEVICE = ""  # "cpu", "0", "0,1"; empty lets Ultralytics auto-select.
 
 # Unknown-decision thresholds and model weights — loaded from tuner output if available.
-_BEST_PARAMS_JSON = PROJECT_ROOT / "runs" / "detect" / "tune_wbf" / "best_params_bayesian_3.json"
+_BEST_PARAMS_JSON = PROJECT_ROOT / "runs" / "detect" / "tune_wbf_6" / "best_params_bayesian_6.json"
 _defaults = {
-    "MIN_MODEL_SUPPORT": 2,
+    "MIN_MODEL_SUPPORT": 5,
     "KNOWN_FUSED_CONF_THRESH": 0.68770202403814,
     "SCORE_MARGIN_THRESH": 0.5582857958051067,
     "DISAGREEMENT_RATIO_THRESH": 0.15223066760019896,
     "MODEL_WEIGHTS": {
+        "yolo8n":  {"bird": 1.0173818474125131,  "drone": 1.3684375247874139,  "unknown": 1.1646555286393707},
+        "yolo8m":  {"bird": 1.0,  "drone": 1.0,  "unknown": 1.0},
         "yolo9t":  {"bird": 1.3345783180967155,  "drone": 1.3246461700191348,  "unknown": 1.4472517946232146},
+        "yolo10n": {"bird": 0.701091472694561,   "drone": 0.9099028240616815,  "unknown": 0.718502456356537},
         "yolo11n": {"bird": 1.3215138210731259,  "drone": 1.9403016932408828,  "unknown": 1.338899849846067},
+        "yolo12n": {"bird": 0.8035608928262429,  "drone": 1.3438739986019623,  "unknown": 1.3166024543945136},
         "yolo26n": {"bird": 1.3364625610235248,  "drone": 1.1804482074749882,  "unknown": 1.746577505269269},
+        "fasterrcnn": {"bird": 1.0, "drone": 1.0, "unknown": 1.0},
     },
 }
 if _BEST_PARAMS_JSON.exists():
@@ -58,17 +83,68 @@ MODEL_WEIGHTS              = _defaults["MODEL_WEIGHTS"]
 
 # Ensemble model list: (name, path_to_weights)
 MODELS = [
-    ("yolo9t",  PROJECT_ROOT / "runs" / "detect" / "yolo9t"  / "weights" / "best.pt"),
+    ("yolo8n", PROJECT_ROOT / "runs" / "detect" / "yolo8n" / "weights" / "best.pt"),
+    ("yolo8m", PROJECT_ROOT / "runs" / "detect" / "yolo8m" / "weights" / "best.pt"),
+    ("yolo9t", PROJECT_ROOT / "runs" / "detect" / "yolo9t" / "weights" / "best.pt"),
+    ("yolo10n", PROJECT_ROOT / "runs" / "detect" / "yolo10n" / "weights" / "best.pt"),
     ("yolo11n", PROJECT_ROOT / "runs" / "detect" / "yolo11n" / "weights" / "best.pt"),
+    ("yolo12n", PROJECT_ROOT / "runs" / "detect" / "yolo12n" / "weights" / "best.pt"),
     ("yolo26n", PROJECT_ROOT / "runs" / "detect" / "yolo26n" / "weights" / "best.pt"),
+    ("fasterrcnn", PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "fasterrcnn_epoch_50.pt"),
 ]
 
 SAVE_PLOT = True
 VERBOSE = False
 
-OUTPUT_DIR = PROJECT_ROOT / "runs" / "detect" / "weighted_voter2"
+OUTPUT_DIR = PROJECT_ROOT / "runs" / "detect" / "weighted_voter"
 SAVE_PLOT_PATH = OUTPUT_DIR / "confusion_matrix_eval.png"
 SAVE_METRICS_CSV_PATH = OUTPUT_DIR / "metrics_table_eval.csv"
+
+
+class _FasterRCNNBoxes:
+    """Mimics the Ultralytics .boxes interface for WBF fusion."""
+
+    def __init__(self, xyxy, cls, conf):
+        self.xyxy = xyxy
+        self.cls = cls
+        self.conf = conf
+
+    def __len__(self):
+        return self.xyxy.shape[0]
+
+
+class _FasterRCNNResult:
+    def __init__(self, boxes):
+        self.boxes = boxes
+
+
+class FasterRCNNWrapper:
+    """Wraps a torchvision Faster R-CNN model to match the Ultralytics .predict() interface."""
+
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+
+    def predict(self, source, conf, imgsz=None, device=None, verbose=False):
+        img = Image.open(source).convert("RGB")
+        img_tensor = (
+            torch.from_numpy(np.array(img, dtype="uint8"))
+            .permute(2, 0, 1)
+            .float()
+            / 255.0
+        ).to(self.device)
+
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model([img_tensor])
+
+        output = outputs[0]
+        boxes = output["boxes"].cpu()
+        labels = output["labels"].float().cpu()
+        scores = output["scores"].cpu()
+
+        mask = scores >= conf
+        return [_FasterRCNNResult(_FasterRCNNBoxes(boxes[mask], labels[mask], scores[mask]))]
 
 
 def class_name_from_id(cls_id: int) -> str:
@@ -535,11 +611,29 @@ def main():
     loaded_models = []
     print("Loading ensemble models...")
     for model_name, model_path in MODELS:
+        if not ENABLED_MODELS.get(model_name, False):
+            continue
         if not model_path.exists():
             print(f"[SKIP] {model_name}: file not found at {model_path}")
             continue
-        model = YOLO(str(model_path))
-        class_map = build_model_class_map(model)
+        if model_name == "fasterrcnn":
+            _device = torch.device(
+                "cuda" if torch.cuda.is_available() and DEVICE != "cpu" else "cpu"
+            )
+            _ckpt = torch.load(str(model_path), map_location=_device, weights_only=False)
+            _num_classes = _ckpt["model_state_dict"][
+                "roi_heads.box_predictor.cls_score.weight"
+            ].shape[0]
+            _frcnn = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None)
+            _in_features = _frcnn.roi_heads.box_predictor.cls_score.in_features
+            _frcnn.roi_heads.box_predictor = FastRCNNPredictor(_in_features, _num_classes)
+            _frcnn.load_state_dict(_ckpt["model_state_dict"])
+            _frcnn.to(_device).eval()
+            model = FasterRCNNWrapper(_frcnn, _device)
+            class_map = {1: "bird", 2: "drone", 3: "unknown"}
+        else:
+            model = YOLO(str(model_path))
+            class_map = build_model_class_map(model)
         loaded_models.append((model_name, model, class_map))
         print(f"[OK]   {model_name}: {model_path.name}")
 
@@ -569,9 +663,9 @@ def main():
             valid_label_paths.append(label_path)
 
     if len(image_paths) == 0:
-        raise ValueError(f"No validation images found in {IMAGES_DIR}")
+        raise ValueError(f"No test images found in {IMAGES_DIR}")
 
-    print(f"Running weighted box fusion inference on {len(image_paths)} validation images...")
+    print(f"Running weighted box fusion inference on {len(image_paths)} test images...")
     total_files = len(image_paths)
     start_time = time.time()
 
@@ -615,14 +709,14 @@ def main():
     )
 
     print(f"\n{'=' * 70}")
-    print("Ensemble: Weighted Boxes Fusion (Top-3)")
+    print("Ensemble: Weighted Boxes Fusion")
     print(f"{'=' * 70}")
     per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
     print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics)
     print()
 
     if SAVE_PLOT:
-        plot_confusion(matrix, SAVE_PLOT_PATH, "Weighted Boxes Fusion (Top-3)")
+        plot_confusion(matrix, SAVE_PLOT_PATH, "Weighted Boxes Fusion")
         print(f"Saved confusion matrix plot to {SAVE_PLOT_PATH}")
 
         save_metrics_table_csv(

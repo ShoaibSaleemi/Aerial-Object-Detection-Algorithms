@@ -176,6 +176,9 @@ def main():
 
     frame_ious:     list[float] = []
     frame_dists:    list[float] = []
+    frame_confs:    list[float] = []
+    frame_detected: list[int]   = []
+    frame_numbers:  list[int]   = []
     covered_frames: int = 0
     exist1_frames:  int = 0
 
@@ -222,19 +225,30 @@ def main():
                 exist1_frames += 1
 
                 best_iou  = 0.0
-                best_dist = float("inf")
+                best_dist = float("nan")
+                best_conf = 0.0
+                detected  = 0
                 if hasattr(r, "boxes") and len(r.boxes) > 0:
                     covered_frames += 1
-                    for box in r.boxes.xyxy.cpu().numpy():
+                    detected = 1
+                    for box, conf in zip(
+                        r.boxes.xyxy.cpu().numpy(),
+                        r.boxes.conf.cpu().numpy(),
+                    ):
                         iou_val = _iou(box.tolist(), gt_xyxy)
                         if iou_val > best_iou:
                             best_iou  = iou_val
                             tcx = (box[0] + box[2]) / 2.0
                             tcy = (box[1] + box[3]) / 2.0
                             best_dist = float(np.hypot(tcx - gt_cx, tcy - gt_cy))
+                        if float(conf) > best_conf:
+                            best_conf = float(conf)
 
                 frame_ious.append(best_iou)
                 frame_dists.append(best_dist)
+                frame_confs.append(best_conf)
+                frame_detected.append(detected)
+                frame_numbers.append(processed + 1)
 
         writer.write(frame)
 
@@ -312,6 +326,36 @@ def main():
         fig.savefig(str(plot_path), dpi=120)
         plt.close(fig)
         print(f"\n  Eval plot → {plot_path}")
+
+        # ── Per-frame metrics plot ──────────────────────────────────────────
+        frames_x = np.array(frame_numbers, dtype=np.float32)
+        metrics = [
+            ("IoU",                     np.array(frame_ious,     dtype=np.float32), (0.0, 1.0)),
+            ("Center distance (px)",    np.array(frame_dists,    dtype=np.float32), None),
+            ("Detection confidence",    np.array(frame_confs,    dtype=np.float32), (0.0, 1.0)),
+            ("Detected (0/1)",          np.array(frame_detected, dtype=np.float32), (-0.1, 1.1)),
+        ]
+
+        fig2, axes = plt.subplots(
+            len(metrics), 1,
+            figsize=(12, 3 * len(metrics)),
+            sharex=True,
+        )
+        fig2.suptitle(f"{run_name}  —  per-frame metrics", fontsize=13, fontweight="bold")
+
+        for ax, (label, values, ylim) in zip(axes, metrics):
+            ax.plot(frames_x, values, linewidth=1.0)
+            ax.set_ylabel(label, fontsize=10)
+            if ylim is not None:
+                ax.set_ylim(*ylim)
+            ax.grid(True, alpha=0.35)
+
+        axes[-1].set_xlabel("Frame", fontsize=10)
+        fig2.tight_layout()
+        perframe_plot_path = output_path.parent / f"{video_path.stem}_{run_name}_perframe.png"
+        fig2.savefig(str(perframe_plot_path), dpi=120)
+        plt.close(fig2)
+        print(f"  Per-frame plot → {perframe_plot_path}")
 
         csv_path = output_path.parent / f"{video_path.stem}_{run_name}_eval.csv"
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
