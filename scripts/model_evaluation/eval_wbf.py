@@ -8,6 +8,8 @@ from itertools import zip_longest
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
+import hashlib
+import pickle
 import torch
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
@@ -39,8 +41,8 @@ MODEL_CONF_THRESH = {
 
 # Enable/disable models in the ensemble
 ENABLED_MODELS = {
-    "yolo8n": True,
-    "yolo8m": False,
+    "yolo8n": False,
+    "yolo8m": True,
     "yolo9t": False,
     "yolo10n": False,
     "yolo11n": False,
@@ -95,6 +97,11 @@ MODELS = [
 
 SAVE_PLOT = True
 VERBOSE = False
+
+TICK_LABEL_FONTSIZE = 22
+AXIS_LABEL_FONTSIZE = 22
+CELL_VALUE_FONTSIZE = 33  # Font size for the numbers inside the confusion matrix cells.
+PREDICTED_LABEL_PAD = -14  # Distance (points) between "Predicted" label and the matrix; decrease to move closer.
 
 OUTPUT_DIR = PROJECT_ROOT / "runs" / "detect" / "weighted_voter"
 SAVE_PLOT_PATH = OUTPUT_DIR / "confusion_matrix_eval.png"
@@ -454,21 +461,24 @@ def build_confusion_matrix(fused_results, label_paths, images_dir, iou_thresh, v
 
 def plot_confusion(matrix, save_path, title_prefix):
     fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(matrix, cmap="Blues")
+    ax.imshow(matrix, cmap="Blues")
 
     ax.set_xticks(np.arange(len(CLASS_NAMES)))
     ax.set_yticks(np.arange(len(CLASS_NAMES)))
-    ax.set_xticklabels(CLASS_NAMES)
-    ax.set_yticklabels(CLASS_NAMES)
-    ax.set_xlabel("Ground Truth")
-    ax.set_ylabel("Predicted")
-    ax.set_title(f"{title_prefix} Confusion Matrix")
+    ax.set_xticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
+    ax.set_yticklabels(CLASS_NAMES, fontsize=TICK_LABEL_FONTSIZE)
+    ax.set_xlabel("Ground Truth", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("Predicted", fontsize=AXIS_LABEL_FONTSIZE, labelpad=PREDICTED_LABEL_PAD)
 
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
-            ax.text(j, i, matrix[i, j], ha="center", va="center", color="black")
+            text_color = "white" if i == 2 and j == 2 else "black"
+            ax.text(
+                j, i, matrix[i, j],
+                ha="center", va="center",
+                color=text_color, fontsize=CELL_VALUE_FONTSIZE,
+            )
 
-    fig.colorbar(im, ax=ax)
     fig.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -605,118 +615,189 @@ def save_metrics_table_csv(per_class_metrics, macro_metrics, save_path):
         writer.writerows(rows)
 
 
+def _make_cache_key_dict() -> dict:
+    """Return a dict of every hyperparameter that affects the WBF evaluation result."""
+    return {
+        "images_dir": str(IMAGES_DIR),
+        "labels_dir": str(LABELS_DIR),
+        "iou_thresh": IOU_THRESH,
+        "conf_thresh": CONF_THRESH,
+        "model_conf_thresh": MODEL_CONF_THRESH,
+        "enabled_models": ENABLED_MODELS,
+        "fusion_iou_thresh": FUSION_IOU_THRESH,
+        "imgsz": IMGSZ,
+        "min_model_support": MIN_MODEL_SUPPORT,
+        "known_fused_conf_thresh": KNOWN_FUSED_CONF_THRESH,
+        "score_margin_thresh": SCORE_MARGIN_THRESH,
+        "disagreement_ratio_thresh": DISAGREEMENT_RATIO_THRESH,
+        "model_weights": MODEL_WEIGHTS,
+        "model_paths": {name: str(path) for name, path in MODELS},
+    }
+
+
+def _build_cache_path() -> Path:
+    key_str = json.dumps(_make_cache_key_dict(), sort_keys=True)
+    key_hash = hashlib.md5(key_str.encode()).hexdigest()[:12]
+    cache_dir = OUTPUT_DIR / "eval_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"wbf_cache_{key_hash}.pkl"
+
+
+def load_wbf_cache(cache_path: Path):
+    if not cache_path.exists():
+        return None
+    try:
+        with cache_path.open("rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def save_wbf_cache(cache_path: Path, ensemble_matrix, per_model_matrices, key_dict):
+    payload = {
+        "hyperparameters": key_dict,
+        "ensemble_matrix": ensemble_matrix,
+        "per_model_matrices": per_model_matrices,
+    }
+    with cache_path.open("wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    loaded_models = []
-    print("Loading ensemble models...")
-    for model_name, model_path in MODELS:
-        if not ENABLED_MODELS.get(model_name, False):
-            continue
-        if not model_path.exists():
-            print(f"[SKIP] {model_name}: file not found at {model_path}")
-            continue
-        if model_name == "fasterrcnn":
-            _device = torch.device(
-                "cuda" if torch.cuda.is_available() and DEVICE != "cpu" else "cpu"
+    cache_path = _build_cache_path()
+    cached = load_wbf_cache(cache_path)
+
+    if cached is not None:
+        print(f"Using cached WBF evaluation: {cache_path.name}")
+        per_model_matrices = cached["per_model_matrices"]
+        ensemble_matrix = cached["ensemble_matrix"]
+    else:
+        loaded_models = []
+        print("Loading ensemble models...")
+        for model_name, model_path in MODELS:
+            if not ENABLED_MODELS.get(model_name, False):
+                continue
+            if not model_path.exists():
+                print(f"[SKIP] {model_name}: file not found at {model_path}")
+                continue
+            if model_name == "fasterrcnn":
+                _device = torch.device(
+                    "cuda" if torch.cuda.is_available() and DEVICE != "cpu" else "cpu"
+                )
+                _ckpt = torch.load(str(model_path), map_location=_device, weights_only=False)
+                _num_classes = _ckpt["model_state_dict"][
+                    "roi_heads.box_predictor.cls_score.weight"
+                ].shape[0]
+                _frcnn = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None)
+                _in_features = _frcnn.roi_heads.box_predictor.cls_score.in_features
+                _frcnn.roi_heads.box_predictor = FastRCNNPredictor(_in_features, _num_classes)
+                _frcnn.load_state_dict(_ckpt["model_state_dict"])
+                _frcnn.to(_device).eval()
+                model = FasterRCNNWrapper(_frcnn, _device)
+                class_map = {1: "bird", 2: "drone", 3: "unknown"}
+            else:
+                model = YOLO(str(model_path))
+                class_map = build_model_class_map(model)
+            loaded_models.append((model_name, model, class_map))
+            print(f"[OK]   {model_name}: {model_path.name}")
+
+        if len(loaded_models) == 0:
+            raise ValueError("No ensemble models were loaded. Check MODELS paths.")
+
+        global MIN_MODEL_SUPPORT
+        if len(loaded_models) < MIN_MODEL_SUPPORT:
+            print(
+                f"  [NOTE] MIN_MODEL_SUPPORT ({MIN_MODEL_SUPPORT}) > loaded models ({len(loaded_models)}); "
+                f"capping to {len(loaded_models)}."
             )
-            _ckpt = torch.load(str(model_path), map_location=_device, weights_only=False)
-            _num_classes = _ckpt["model_state_dict"][
-                "roi_heads.box_predictor.cls_score.weight"
-            ].shape[0]
-            _frcnn = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None)
-            _in_features = _frcnn.roi_heads.box_predictor.cls_score.in_features
-            _frcnn.roi_heads.box_predictor = FastRCNNPredictor(_in_features, _num_classes)
-            _frcnn.load_state_dict(_ckpt["model_state_dict"])
-            _frcnn.to(_device).eval()
-            model = FasterRCNNWrapper(_frcnn, _device)
-            class_map = {1: "bird", 2: "drone", 3: "unknown"}
-        else:
-            model = YOLO(str(model_path))
-            class_map = build_model_class_map(model)
-        loaded_models.append((model_name, model, class_map))
-        print(f"[OK]   {model_name}: {model_path.name}")
+            MIN_MODEL_SUPPORT = len(loaded_models)
 
-    if len(loaded_models) == 0:
-        raise ValueError("No ensemble models were loaded. Check MODELS paths.")
+        if not LABELS_DIR.exists():
+            raise FileNotFoundError(f"Label directory not found: {LABELS_DIR}")
 
-    if not LABELS_DIR.exists():
-        raise FileNotFoundError(f"Label directory not found: {LABELS_DIR}")
+        label_paths = sorted(list(LABELS_DIR.glob("*.txt")))
+        if len(label_paths) == 0:
+            raise ValueError(f"No label files found in {LABELS_DIR}")
 
-    label_paths = sorted(list(LABELS_DIR.glob("*.txt")))
-    if len(label_paths) == 0:
-        raise ValueError(f"No label files found in {LABELS_DIR}")
+        image_paths = []
+        valid_label_paths = []
+        for label_path in label_paths:
+            image_name = label_path.stem
+            image_path = IMAGES_DIR / f"{image_name}.jpg"
+            if not image_path.exists():
+                for ext in [".png", ".jpeg", ".bmp", ".tif", ".tiff"]:
+                    candidate = IMAGES_DIR / f"{image_name}{ext}"
+                    if candidate.exists():
+                        image_path = candidate
+                        break
+            if image_path.exists():
+                image_paths.append(image_path)
+                valid_label_paths.append(label_path)
 
-    image_paths = []
-    valid_label_paths = []
-    for label_path in label_paths:
-        image_name = label_path.stem
-        image_path = IMAGES_DIR / f"{image_name}.jpg"
-        if not image_path.exists():
-            for ext in [".png", ".jpeg", ".bmp", ".tif", ".tiff"]:
-                candidate = IMAGES_DIR / f"{image_name}{ext}"
-                if candidate.exists():
-                    image_path = candidate
-                    break
-        if image_path.exists():
-            image_paths.append(image_path)
-            valid_label_paths.append(label_path)
+        if len(image_paths) == 0:
+            raise ValueError(f"No test images found in {IMAGES_DIR}")
 
-    if len(image_paths) == 0:
-        raise ValueError(f"No test images found in {IMAGES_DIR}")
+        print(f"Running weighted box fusion inference on {len(image_paths)} test images...")
+        total_files = len(image_paths)
+        start_time = time.time()
 
-    print(f"Running weighted box fusion inference on {len(image_paths)} test images...")
-    total_files = len(image_paths)
-    start_time = time.time()
+        fused_results_per_image = []
+        per_model_results = {model_name: [] for model_name, _, _ in loaded_models}
+        for idx, image_path in enumerate(image_paths, 1):
+            fused, per_model_preds = run_weighted_boxes_fusion_on_image(loaded_models, image_path)
+            fused_results_per_image.append(fused)
+            for model_name in per_model_results:
+                per_model_results[model_name].append(per_model_preds[model_name])
 
-    fused_results_per_image = []
-    per_model_results = {model_name: [] for model_name, _, _ in loaded_models}
-    for idx, image_path in enumerate(image_paths, 1):
-        fused, per_model_preds = run_weighted_boxes_fusion_on_image(loaded_models, image_path)
-        fused_results_per_image.append(fused)
-        for model_name in per_model_results:
-            per_model_results[model_name].append(per_model_preds[model_name])
+            elapsed = time.time() - start_time
+            minutes, seconds = divmod(int(elapsed), 60)
+            print(
+                f"Progress: {idx}/{total_files} ({idx / total_files * 100:.1f}%) Elapsed: {minutes}:{seconds:02d}",
+                end="\r",
+            )
+        print()
 
-        elapsed = time.time() - start_time
-        minutes, seconds = divmod(int(elapsed), 60)
-        print(
-            f"Progress: {idx}/{total_files} ({idx / total_files * 100:.1f}%) Elapsed: {minutes}:{seconds:02d}",
-            end="\r",
-        )
-    print()
+        per_model_matrices = {}
+        for model_name, _, _ in loaded_models:
+            model_matrix, _, _ = build_confusion_matrix(
+                per_model_results[model_name],
+                valid_label_paths,
+                IMAGES_DIR,
+                IOU_THRESH,
+                VERBOSE,
+            )
+            per_model_matrices[model_name] = model_matrix
 
-    # Print per-model metrics first.
-    for model_name, _, _ in loaded_models:
-        model_matrix, _, _ = build_confusion_matrix(
-            per_model_results[model_name],
+        ensemble_matrix, _, _ = build_confusion_matrix(
+            fused_results_per_image,
             valid_label_paths,
             IMAGES_DIR,
             IOU_THRESH,
             VERBOSE,
         )
+
+        save_wbf_cache(cache_path, ensemble_matrix, per_model_matrices, _make_cache_key_dict())
+        print(f"Saved evaluation cache: {cache_path.name}")
+
+    # Print per-model metrics.
+    for model_name, model_matrix in per_model_matrices.items():
         print(f"\n{'=' * 70}")
         print(f"Model: {model_name}")
         print(f"{'=' * 70}")
         pcm, mm, sm = compute_metrics_from_confusion(model_matrix)
         print_confusion_and_metrics_side_by_side(model_matrix, pcm, mm)
 
-    matrix, total_known, total_unknown = build_confusion_matrix(
-        fused_results_per_image,
-        valid_label_paths,
-        IMAGES_DIR,
-        IOU_THRESH,
-        VERBOSE,
-    )
-
     print(f"\n{'=' * 70}")
     print("Ensemble: Weighted Boxes Fusion")
     print(f"{'=' * 70}")
-    per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(matrix)
-    print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_metrics)
+    per_class_metrics, macro_metrics, summary_metrics = compute_metrics_from_confusion(ensemble_matrix)
+    print_confusion_and_metrics_side_by_side(ensemble_matrix, per_class_metrics, macro_metrics)
     print()
 
     if SAVE_PLOT:
-        plot_confusion(matrix, SAVE_PLOT_PATH, "Weighted Boxes Fusion")
+        plot_confusion(ensemble_matrix, SAVE_PLOT_PATH, "Weighted Boxes Fusion")
         print(f"Saved confusion matrix plot to {SAVE_PLOT_PATH}")
 
         save_metrics_table_csv(
