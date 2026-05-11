@@ -137,7 +137,7 @@ def main():
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
-    output_path = PROJECT_ROOT / "runs" / "detect" / "inference" / f"{video_path.stem}_{run_name}_inference.mp4"
+    output_path = PROJECT_ROOT / "runs" / "detect" / "inference_video" / f"{video_path.stem}_{run_name}_inference.mp4"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     model = YOLO(str(model_path))
@@ -362,6 +362,17 @@ def main():
         fig2.savefig(str(perframe_plot_path), dpi=120)
         plt.close(fig2)
         print(f"  Per-frame plot → {perframe_plot_path}")
+
+        npz_path = output_path.parent / f"{video_path.stem}_{run_name}_perframe.npz"
+        np.savez(
+            str(npz_path),
+            frame_numbers=np.array(frame_numbers, dtype=np.int32),
+            frame_ious=np.array(frame_ious, dtype=np.float32),
+            frame_dists=np.array(frame_dists, dtype=np.float32),
+            frame_confs=np.array(frame_confs, dtype=np.float32),
+            frame_cls_ids=np.array(frame_cls_ids, dtype=np.int32),
+        )
+        print(f"  Per-frame npz  → {npz_path}")
 
         csv_path = output_path.parent / f"{video_path.stem}_{run_name}_eval.csv"
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
