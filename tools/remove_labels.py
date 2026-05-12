@@ -5,11 +5,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-# Remove helicopter and plane samples so train/validation stay closed-set
-# for bird and drone detection.
+# Keep only labels with classes 0, 1, or 2 in validation and test.
+# Any label file containing a class outside that set is removed along with its image.
 dataset_splits = [
-    (str(PROJECT_ROOT / "dataset" / "train" / "labels"), str(PROJECT_ROOT / "dataset" / "train" / "images")),
     (str(PROJECT_ROOT / "dataset" / "validation" / "labels"), str(PROJECT_ROOT / "dataset" / "validation" / "images")),
+    (str(PROJECT_ROOT / "dataset" / "test"       / "labels"), str(PROJECT_ROOT / "dataset" / "test"       / "images")),
 ]
 
 # Count label files across all configured splits for a single progress bar.
@@ -29,8 +29,8 @@ for label_dir, image_dir in dataset_splits:
         with open(path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        # Check if any line has class 0 (helicopter) or 3 (plane)
-        has_unwanted = any(int(line.strip().split()[0]) in [0, 3] for line in lines if line.strip())
+        # Remove the file if it contains any class other than 0, 1, or 2.
+        has_unwanted = any(int(line.strip().split()[0]) not in {0, 1, 2} for line in lines if line.strip())
 
         if has_unwanted:
             # Remove label file

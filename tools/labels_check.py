@@ -79,7 +79,7 @@ def analyse_split(split_name: str, label_dir: Path) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 def print_table(results: dict[str, dict], all_classes: list[int]):
     col_w = 14
-    hdr_w = 8
+    hdr_w = 12
 
     header = f"{'Split':<{hdr_w}}"
     for c in all_classes:

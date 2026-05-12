@@ -120,13 +120,19 @@ SEQ_LEN          = 8     # LSTM history window (frames)
 TRAIL_LEN        = 30    # trail length in frames
 
 # ── STL / RTM requirement constants ──────────────────────────────────────────
+# REQ-01 disabled: 40-100 Hz is above the Nyquist limit of any normal video fps;
+#   bbox-width oscillation cannot encode frequencies that high in frame data.
 REQ01_BRIGHTNESS_WIN  = 20      # frames to analyse for bbox-width oscillation
-REQ01_FLASH_HZ_LO     = 40.0   # minimum flash frequency (Hz)
-REQ01_FLASH_HZ_HI     = 100.0  # maximum flash frequency (Hz)
+REQ01_FLASH_HZ_LO     = 40.0   # minimum flash frequency (Hz)  [NOT reachable at video fps]
+REQ01_FLASH_HZ_HI     = 100.0  # maximum flash frequency (Hz)  [NOT reachable at video fps]
 REQ01_RED_RATIO       = 0.50   # red channel must be ≥ this fraction of peak
-REQ02_AR_VAR_MAX      = 0.01   # max aspect-ratio variance for "hovering"
-REQ02_VEL_MAX         = 2.0    # max Kalman velocity (px/frame) for "hovering"
-REQ03_LIGHT_CONF_MAX  = 0.30   # confidence below this → no light detected → bird
+# REQ-02 disabled: a slow/hovering drone is still a drone — overriding it to
+#   'unknown' whenever velocity ≈ 0 hurts accuracy, not helps it.
+REQ02_AR_VAR_MAX      = 0.01   # max aspect-ratio variance for "hovering"  [disabled]
+REQ02_VEL_MAX         = 2.0    # max Kalman velocity (px/frame) for "hovering"  [disabled]
+# REQ-03: raise threshold to be reachable; fused confidences are typically ~0.75-0.85,
+#   so 0.65 catches genuinely uncertain detections without swallowing normal ones.
+REQ03_LIGHT_CONF_MAX  = 0.65   # confidence below this → no light detected → bird
 REQ04_DEFORM_WIN      = 10     # frames to analyse for shape deformation
 REQ04_SHAPE_EPS       = 0.02   # normalised (w+h std) deformation threshold
 
@@ -494,17 +500,16 @@ class STLChecker:
         override : int | None       — class override (0=bird, 2=unknown) or None
         fired_id : str | None       — req that produced the override, or None
         """
-        r01 = STLChecker.req01_flash_and_red(trk, frame, fw, fh, fps)
-        r02 = STLChecker.req02_hover(trk)
+        # REQ-01 and REQ-02 are disabled (see constant comments above):
+        #   REQ-01 cannot fire because 40-100 Hz > Nyquist limit of video fps.
+        #   REQ-02 wrongly reclassifies hovering/slow drones as unknown.
+        r01 = False
+        r02 = False
         r03 = STLChecker.req03_no_light(conf)
         r04 = STLChecker.req04_shape_deform(trk, fw, fh)
         fires = {"REQ-01": r01, "REQ-02": r02, "REQ-03": r03, "REQ-04": r04}
         if r03:
             return fires, 0, "REQ-03"
-        if r01:
-            return fires, 2, "REQ-01"
-        if r02:
-            return fires, 2, "REQ-02"
         if r04:
             return fires, 0, "REQ-04"
         return fires, None, None
