@@ -201,6 +201,26 @@ def _iou(a: list[float], b: list[float]) -> float:
     return inter / (ua + ub - inter + 1e-9)
 
 
+def _eiou(a: list[float], b: list[float]) -> float:
+    """Extended IoU: IoU minus centre-distance, width, and height penalties.
+    EIoU = IoU - (cx_A-cx_B)²+(cy_A-cy_B)² / (wc²+hc²)
+                - (wA-wB)² / wc²
+                - (hA-hB)² / hc²
+    """
+    iou = _iou(a, b)
+    ax, ay = (a[0] + a[2]) / 2, (a[1] + a[3]) / 2
+    bx, by = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    aw, ah = a[2] - a[0], a[3] - a[1]
+    bw, bh = b[2] - b[0], b[3] - b[1]
+    cx1 = min(a[0], b[0]); cy1 = min(a[1], b[1])
+    cx2 = max(a[2], b[2]); cy2 = max(a[3], b[3])
+    wc = cx2 - cx1; hc = cy2 - cy1
+    center_p = ((ax - bx) ** 2 + (ay - by) ** 2) / (wc ** 2 + hc ** 2 + 1e-9)
+    width_p  = (aw - bw) ** 2 / (wc ** 2 + 1e-9)
+    height_p = (ah - bh) ** 2 / (hc ** 2 + 1e-9)
+    return iou - center_p - width_p - height_p
+
+
 def cluster_detections(detections: list[dict], iou_thresh: float) -> list[list[dict]]:
     clusters: list[dict] = []
     for det in sorted(detections, key=lambda d: d["confidence"], reverse=True):
@@ -587,7 +607,7 @@ def choose_video_file() -> Path:
 def main():
     video_path = choose_video_file()
 
-    output_dir = PROJECT_ROOT / "runs" / "detect" / "inference"
+    output_dir = PROJECT_ROOT / "runs" / "detect" / "inference_video"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{video_path.stem}_wbf_tracking.mp4"
 
@@ -675,20 +695,23 @@ def main():
 
     # Per-frame evaluation accumulators
     frame_ious:     list[float] = []  # IoU vs GT per exist=1 frame
-    frame_dists:    list[float] = []  # centre distance per exist=1 frame
+    frame_eious:    list[float] = []  # EIoU vs GT per exist=1 frame
     frame_confs:    list[float] = []  # best track confidence per exist=1 frame
     frame_cls_ids:  list[int]   = []  # class ID of best-matching track per exist=1 frame (-1 = none)
     frame_numbers:  list[int]   = []  # 1-based frame index
+    map_preds:      list[tuple[float, float, int]] = []  # (conf, iou_with_gt, frame_idx) for all preds in exist=1 frames
     covered_frames: int = 0           # exist=1 frames where ≥1 track present
     exist1_frames:  int = 0           # total exist=1 frames seen
 
     processed  = 0
-    start_time = time.time()
+    start_time: float = 0.0
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+        if processed == 0:
+            start_time = time.time()
 
         # Stage 1 — WBF fusion
         fused = run_wbf_on_frame(loaded_models, frame)
@@ -712,30 +735,27 @@ def main():
                 )
 
                 gt_xyxy = [float(rx), float(ry), float(rx + rw), float(ry + rh)]
-                gt_cx   = rx + rw / 2.0
-                gt_cy   = ry + rh / 2.0
                 exist1_frames += 1
 
                 best_iou  = 0.0
-                best_dist = float("nan")
+                best_eiou = 0.0
                 best_conf = 0.0
                 best_cls  = -1
                 for box_xyxy, _tid, _cls, _conf, _lstm in track_results:
                     iou_val = _iou(box_xyxy, gt_xyxy)
                     if iou_val > best_iou:
                         best_iou  = iou_val
-                        tcx = (box_xyxy[0] + box_xyxy[2]) / 2.0
-                        tcy = (box_xyxy[1] + box_xyxy[3]) / 2.0
-                        best_dist = float(np.hypot(tcx - gt_cx, tcy - gt_cy))
+                        best_eiou = _eiou(box_xyxy, gt_xyxy)
                         best_cls  = int(_cls)
                     if float(_conf) > best_conf:
                         best_conf = float(_conf)
+                    map_preds.append((float(_conf), iou_val, processed))
 
                 if track_results:
                     covered_frames += 1
 
                 frame_ious.append(best_iou)
-                frame_dists.append(best_dist)
+                frame_eious.append(best_eiou)
                 frame_confs.append(best_conf)
                 frame_cls_ids.append(best_cls)
                 frame_numbers.append(processed + 1)
@@ -771,18 +791,45 @@ def main():
     # ── Evaluation summary ───────────────────────────────────────────────────
     if has_gt and exist1_frames > 0:
         iou_arr  = np.array(frame_ious,  dtype=np.float32)
-        dist_arr = np.array(frame_dists, dtype=np.float32)
 
         thr_iou  = np.linspace(0.0, 1.0, 101)
         success  = np.array([(iou_arr >= t).mean() for t in thr_iou], dtype=np.float32)
         auc      = float(np.trapezoid(success, thr_iou))
         sr50     = float((iou_arr >= 0.5).mean())
 
-        thr_dist = np.arange(0, 51, dtype=np.float32)
-        precision = np.array([(dist_arr <= t).mean() for t in thr_dist], dtype=np.float32)
-        prec20   = float((dist_arr <= 20.0).mean())
         coverage = covered_frames / exist1_frames
         mean_iou = float(iou_arr.mean())
+
+        # ── mAP (COCO-style 101-point interpolation) ─────────────────────
+        def _compute_ap(preds: list, gt_count: int, iou_thresh: float) -> float:
+            """AP with greedy matching (one TP per GT box per frame)."""
+            if not preds or gt_count == 0:
+                return 0.0
+            sorted_preds = sorted(preds, key=lambda x: x[0], reverse=True)
+            matched: set[int] = set()
+            tp_list: list[int] = []
+            for _conf, iou, fidx in sorted_preds:
+                if iou >= iou_thresh and fidx not in matched:
+                    tp_list.append(1)
+                    matched.add(fidx)
+                else:
+                    tp_list.append(0)
+            cum_tp   = np.cumsum(tp_list, dtype=np.float64)
+            cum_fp   = np.cumsum([1 - t for t in tp_list], dtype=np.float64)
+            recall    = cum_tp / gt_count
+            precision_vals = cum_tp / (cum_tp + cum_fp + 1e-9)
+            # 101-point interpolated AP (COCO style)
+            ap = 0.0
+            for thr in np.linspace(0.0, 1.0, 101):
+                mask = recall >= thr
+                ap  += (precision_vals[mask].max() if mask.any() else 0.0)
+            return ap / 101
+
+        ap50      = _compute_ap(map_preds, exist1_frames, 0.50)
+        map50_95  = float(np.mean([
+            _compute_ap(map_preds, exist1_frames, t)
+            for t in np.arange(0.50, 1.00, 0.05)
+        ]))
 
         sep = "─" * 52
         print(f"\n{sep}")
@@ -791,11 +838,12 @@ def main():
         print(f"  {'Mean IoU:':<32}{mean_iou * 100:.2f}%")
         print(f"  {'Success Rate  @IoU≥0.5:':<32}{sr50 * 100:.2f}%")
         print(f"  {'AUC  (success curve 0→1):':<32}{auc * 100:.2f}%")
-        print(f"  {'Precision  @20 px:':<32}{prec20 * 100:.2f}%")
         print(f"  {'Coverage:':<32}{coverage * 100:.2f}%  ({covered_frames}/{exist1_frames})")
+        print(f"  {'AP@50:':<32}{ap50 * 100:.2f}%")
+        print(f"  {'mAP@50:95:':<32}{map50_95 * 100:.2f}%")
         print(sep)
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+        fig, ax1 = plt.subplots(1, 1, figsize=(6, 4))
 
         ax1.plot(thr_iou, success, linewidth=2)
         ax1.set_xlabel("IoU threshold")
@@ -804,14 +852,6 @@ def main():
         ax1.set_xlim(0, 1); ax1.set_ylim(0, 1)
         ax1.grid(True, alpha=0.4)
 
-        ax2.plot(thr_dist, precision, linewidth=2)
-        ax2.axvline(20, color="gray", linestyle="--", linewidth=1, label="20 px")
-        ax2.set_xlabel("Centre distance threshold (px)")
-        ax2.set_ylabel("Precision")
-        ax2.set_title(f"Precision curve  @20px={prec20:.3f}")
-        ax2.set_xlim(0, 50); ax2.set_ylim(0, 1)
-        ax2.legend(); ax2.grid(True, alpha=0.4)
-
         fig.tight_layout()
         plot_path = output_dir / f"{video_path.stem}_wbf_eval.png"
         fig.savefig(str(plot_path), dpi=120)
@@ -819,24 +859,29 @@ def main():
         print(f"\n  Eval plot → {plot_path}")
 
         # ── Per-frame metrics plot ──────────────────────────────────────────
-        frames_x = np.array(frame_numbers, dtype=np.float32)
+        frames_x  = np.array(frame_numbers, dtype=np.float32)
+        iou_vals  = np.array(frame_ious,   dtype=np.float32)
+        eiou_vals = np.array(frame_eious,  dtype=np.float32)
+        # EIoU penalty = IoU − EIoU: shows centre/shape mismatch, always ≥ 0.
+        # (EIoU ≈ IoU when tracking is tight; penalty spikes on alignment failures.)
+        eiou_penalty = iou_vals - eiou_vals
         metrics = [
-            ("IoU",                     np.array(frame_ious,    dtype=np.float32), (0.0, 1.0)),
-            ("Center distance (px)",    np.array(frame_dists,   dtype=np.float32), None),
-            ("Detection confidence",    np.array(frame_confs,   dtype=np.float32), (0.0, 1.0)),
+            ("IoU",                     iou_vals,                                  (0.0,  1.0)),
+            ("EIoU penalty (IoU−EIoU)", eiou_penalty,                              (0.0,  None)),
+            ("Detection confidence",    np.array(frame_confs,   dtype=np.float32), (0.0,  1.0)),
             ("Class ID",                np.array(frame_cls_ids, dtype=np.float32), (-1.5, 2.5)),
         ]
 
         fig2, axes = plt.subplots(
             len(metrics), 1,
-            figsize=(12, 3 * len(metrics)),
+            figsize=(16, 4 * len(metrics)),
             sharex=True,
         )
-        fig2.suptitle("WBF tracking  —  per-frame metrics", fontsize=13, fontweight="bold")
+        fig2.suptitle("WBF tracking  —  per-frame metrics", fontsize=15, fontweight="bold")
 
         for ax, (label, values, ylim) in zip(axes, metrics):
             ax.plot(frames_x, values, linewidth=1.0)
-            ax.set_ylabel(label, fontsize=10)
+            ax.set_ylabel(label, fontsize=13)
             if ylim is not None:
                 ax.set_ylim(*ylim)
             ax.grid(True, alpha=0.35)
@@ -844,14 +889,25 @@ def main():
         # Class ID axis: integer ticks with class name labels (-1 = none)
         cls_ax = axes[-1]
         cls_ax.set_yticks([-1, 0, 1, 2])
-        cls_ax.set_yticklabels(["none", "bird", "drone", "unknown"], fontsize=8)
+        cls_ax.set_yticklabels(["none", "bird", "drone", "unknown"], fontsize=11)
 
-        axes[-1].set_xlabel("Frame", fontsize=10)
+        axes[-1].set_xlabel("Frame", fontsize=13)
         fig2.tight_layout()
         perframe_plot_path = output_dir / f"{video_path.stem}_wbf_perframe.png"
-        fig2.savefig(str(perframe_plot_path), dpi=120)
+        fig2.savefig(str(perframe_plot_path), dpi=300)
         plt.close(fig2)
         print(f"  Per-frame plot → {perframe_plot_path}")
+
+        npz_path = output_dir / f"{video_path.stem}_wbf_perframe.npz"
+        np.savez(
+            str(npz_path),
+            frame_numbers=np.array(frame_numbers, dtype=np.int32),
+            frame_ious=np.array(frame_ious, dtype=np.float32),
+            frame_eious=np.array(frame_eious, dtype=np.float32),
+            frame_confs=np.array(frame_confs, dtype=np.float32),
+            frame_cls_ids=np.array(frame_cls_ids, dtype=np.int32),
+        )
+        print(f"  Per-frame npz  → {npz_path}")
 
         csv_path = output_dir / f"{video_path.stem}_wbf_eval.csv"
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -860,8 +916,9 @@ def main():
             writer.writerow(["mean_iou", mean_iou, mean_iou * 100.0, ""])
             writer.writerow(["success_rate_iou_ge_0_5", sr50, sr50 * 100.0, "IoU >= 0.5"])
             writer.writerow(["auc_success_curve_0_to_1", auc, auc * 100.0, ""])
-            writer.writerow(["precision_at_20px", prec20, prec20 * 100.0, "center distance <= 20"])
             writer.writerow(["coverage", coverage, coverage * 100.0, f"{covered_frames}/{exist1_frames}"])
+            writer.writerow(["ap50", ap50, ap50 * 100.0, "COCO-style AP @ IoU=0.50"])
+            writer.writerow(["map50_95", map50_95, map50_95 * 100.0, "COCO-style mAP @ IoU=0.50:0.95"])
             writer.writerow(["covered_frames", covered_frames, "", ""])
             writer.writerow(["present_frames", exist1_frames, "", ""])
             writer.writerow(["processed_frames", processed, "", ""])
