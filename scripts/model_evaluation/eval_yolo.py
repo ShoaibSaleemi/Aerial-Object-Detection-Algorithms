@@ -43,15 +43,16 @@ MODEL_CONF_THRESH = {
 # --- Model selection ---------------------------------------------------------
 # Set a model to True to include it in evaluation, False to skip it.
 # Set RUN_ALL_MODELS = True to override and run every model regardless.
-RUN_ALL_MODELS = True
+RUN_ALL_MODELS = False
 ENABLED_MODELS = {
-    "yolo8n":  True,
-    "yolo8m":  True,
-    "yolo9t":  True,
-    "yolo10n": True,
-    "yolo11n": True,
-    "yolo12n": True,
-    "yolo26n": True,
+    "yolo8n":  False,
+    "yolo8m":  False,
+    "yolo9t":  False,
+    "yolo10n": False,
+    "yolo11n": False,
+    "yolo12n": False,
+    "yolo26n": False,
+    "yolo8n 3": True,
 }
 # -----------------------------------------------------------------------------
 
@@ -267,7 +268,13 @@ def build_confusion_matrix(results, label_paths, images_dir, iou_thresh, verbose
         result = results[image_idx]
         pred_boxes = []
         pred_labels = []
-        if hasattr(result, "boxes") and len(result.boxes) > 0:
+        if isinstance(result, dict):
+            boxes_xyxy = result["boxes_xyxy"]
+            boxes_cls = result["boxes_cls"]
+            for box, cls in zip(boxes_xyxy, boxes_cls):
+                pred_labels.append(int(cls) if int(cls) in (0, 1) else 2)
+                pred_boxes.append(list(box))
+        elif hasattr(result, "boxes") and result.boxes is not None and len(result.boxes) > 0:
             for box, cls in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy()):
                 pred_labels.append(int(cls) if int(cls) in (0, 1) else 2)
                 pred_boxes.append(list(box))
@@ -555,13 +562,24 @@ def main():
                     source=img_path,
                     conf=conf_thresh,
                     imgsz=IMGSZ,
+                    max_det=300,
                     verbose=False,
                 )
-                results.append(result[0] if isinstance(result, list) else result)
+                r = result[0] if isinstance(result, list) else result
+                if r.boxes is not None and len(r.boxes) > 0:
+                    boxes_xyxy = r.boxes.xyxy.cpu().numpy()
+                    boxes_cls = r.boxes.cls.cpu().numpy()
+                else:
+                    boxes_xyxy = np.zeros((0, 4), dtype=np.float32)
+                    boxes_cls = np.zeros(0, dtype=np.float32)
+                results.append({"boxes_xyxy": boxes_xyxy, "boxes_cls": boxes_cls})
+                del r, result
                 processed += 1
                 elapsed = time.time() - start_time
                 minutes, seconds = divmod(int(elapsed), 60)
                 print(f"Progress: {processed}/{total_files} ({processed / total_files * 100:.2f}%) Elapsed: {minutes}:{seconds:02d}", end='\r')
+                if processed % 500 == 0:
+                    torch.cuda.empty_cache()
             print()
 
             matrix, total_known, total_unknown = build_confusion_matrix(
