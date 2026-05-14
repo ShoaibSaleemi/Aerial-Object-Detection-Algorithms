@@ -9,3 +9,9 @@
 !*/
 .conda
 dataset 2/
+dataset/train/labels/*.txt
+dataset/validation/labels/*.txt
+dataset/test/labels/*.txt
+**/*.jpg
+**/*.jpeg
+**/*.png
