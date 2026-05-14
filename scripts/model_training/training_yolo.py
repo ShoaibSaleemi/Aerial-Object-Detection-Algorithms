@@ -18,9 +18,9 @@ if __name__ == "__main__":
     # 1. Load a model
     # model = YOLO("yolov8n.yaml")  # build a new model from YAML (from scratch, not pretrained)
     # model = YOLO("yolov8n.yaml").load("yolo8n.pt")  # build from YAML and transfer weights
-    model = YOLO(str(PROJECT_ROOT / "runs" / "detect" / "yolo11n" / "weights" / "best.pt"))  # fine-tuned on bird/drone, same nc=2
+    model = YOLO(str(PROJECT_ROOT / "yolov8n.pt"))  # pretrained yolov8 nano
 
-    run_name = unique_run_name("yolo11n", PROJECT_ROOT / "runs" / "detect")
+    run_name = unique_run_name("yolo8n", PROJECT_ROOT / "runs" / "detect")
 
     # 2. Train the model, https://docs.ultralytics.com/modes/train/#musgd-optimizer
     results = model.train(
@@ -32,7 +32,7 @@ if __name__ == "__main__":
         workers=0, # avoid Windows shared-memory mapping failures in multi-worker dataloading
         save=True, # save the training checkpoints
         save_period=1, # frequency of saving a checkpoint, specified in epochs
-        optimizer="Adam",
-        lr0=0.001, # Adam needs ~10x lower LR than SGD
+        optimizer="SGD",
+        lr0=0.01, # default SGD learning rate
         resume=False, # fresh start — never resume from a previous run's checkpoint
     )
