@@ -1,7 +1,7 @@
 ﻿"""
-Copies validation images into subfolders by dominant class ID.
+Copies test images into subfolders by dominant class ID.
 
-Output layout inside dataset/validation/:
+Output layout inside dataset/test/:
     bird/      <- class 0 is most frequent in the label
     drone/     <- class 1 is most frequent
     unknown/   <- class 2 is most frequent
@@ -16,9 +16,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
-LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
-OUTPUT_DIR  = PROJECT_ROOT / "dataset" / "validation"
+IMAGES_DIR = PROJECT_ROOT / "dataset" / "test" / "images"
+LABELS_DIR = PROJECT_ROOT / "dataset" / "test" / "labels"
+OUTPUT_DIR  = PROJECT_ROOT / "dataset" / "test"
 
 CLASS_NAMES = {0: "bird", 1: "drone", 2: "unknown"}
 
