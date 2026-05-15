@@ -22,14 +22,14 @@ random.seed(0)
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
 # Toggle between validation and test dataset
-USE_TEST_DATASET = True  # Set to True to evaluate on test dataset, False for validation
+USE_TEST_DATASET = False  # Set to True to evaluate on test dataset, False for validation
 
 # Edit evaluation parameters here.
 DATASET_SPLIT = "test" if USE_TEST_DATASET else "validation"
 IMAGES_DIR = PROJECT_ROOT / "dataset" / DATASET_SPLIT / "images"
 LABELS_DIR = PROJECT_ROOT / "dataset" / DATASET_SPLIT / "labels"
 IOU_THRESH = 0.5
-CONF_THRESH = 0.70
+CONF_THRESH = 0.60
 MODEL_CONF_THRESH = {
     "yolo8n": 0.6863484706628682,
     "yolo8m": 0.7133918823950539,
@@ -52,7 +52,7 @@ ENABLED_MODELS = {
     "yolo11n": False,
     "yolo12n": False,
     "yolo26n": False,
-    "yolo8n 3": True,
+    "yolo8n 2": True,
 }
 # -----------------------------------------------------------------------------
 

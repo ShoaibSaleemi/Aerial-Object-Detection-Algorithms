@@ -110,6 +110,7 @@ MODEL_WEIGHTS = {
 MAX_LOST         = 10    # frames to keep a lost track alive
 MIN_HITS         = 2     # frames before a new track is drawn
 IOU_THRESH_TRACK = 0.30  # greedy matching IoU threshold
+FA_IOU_THRESH    = 0.50  # drone detection IoU below this counts as a false alarm
 SEQ_LEN          = 8     # LSTM history window (frames)
 TRAIL_LEN        = 30    # trail length in frames
 
@@ -702,6 +703,7 @@ def main():
     map_preds:      list[tuple[float, float, int]] = []  # (conf, iou_with_gt, frame_idx) for all preds in exist=1 frames
     covered_frames: int = 0           # exist=1 frames where ≥1 track present
     exist1_frames:  int = 0           # total exist=1 frames seen
+    fa_frames:      int = 0           # frames with a false alarm
 
     processed  = 0
     start_time: float = 0.0
@@ -721,6 +723,8 @@ def main():
         track_results = tracker.update(detections, width, height)
 
         draw_tracks(frame, track_results, tracker.trails)
+
+        is_fa_frame = False
 
         # ── GT overlay + per-frame evaluation ───────────────────────────────
         if has_gt and processed < len(gt_exist):
@@ -743,13 +747,17 @@ def main():
                 best_cls  = -1
                 for box_xyxy, _tid, _cls, _conf, _lstm in track_results:
                     iou_val = _iou(box_xyxy, gt_xyxy)
+                    cls_int = int(_cls)
                     if iou_val > best_iou:
                         best_iou  = iou_val
                         best_eiou = _eiou(box_xyxy, gt_xyxy)
-                        best_cls  = int(_cls)
+                        best_cls  = cls_int
                     if float(_conf) > best_conf:
                         best_conf = float(_conf)
                     map_preds.append((float(_conf), iou_val, processed))
+                    # FA: wrong class (bird/unknown) OR drone with IoU < threshold
+                    if cls_int != 1 or iou_val < FA_IOU_THRESH:
+                        is_fa_frame = True
 
                 if track_results:
                     covered_frames += 1
@@ -760,6 +768,17 @@ def main():
                 frame_cls_ids.append(best_cls)
                 frame_numbers.append(processed + 1)
 
+            elif gt_exist[processed] == 0:
+                # GT absent: any track detection is a false alarm
+                if track_results:
+                    is_fa_frame = True
+
+        elif has_gt:
+            # Beyond GT data length: any track detection is a false alarm
+            if track_results:
+                is_fa_frame = True
+
+        fa_frames += int(is_fa_frame)
         writer.write(frame)
 
         processed += 1
@@ -838,7 +857,10 @@ def main():
         print(f"  {'Mean IoU:':<32}{mean_iou * 100:.2f}%")
         print(f"  {'Success Rate  @IoU≥0.5:':<32}{sr50 * 100:.2f}%")
         print(f"  {'AUC  (success curve 0→1):':<32}{auc * 100:.2f}%")
+        video_duration_h = processed / fps / 3600.0
+        fa_per_h = fa_frames / video_duration_h if video_duration_h > 0 else 0.0
         print(f"  {'Coverage:':<32}{coverage * 100:.2f}%  ({covered_frames}/{exist1_frames})")
+        print(f"  {'False Alarms / hour:':<32}{fa_per_h:.2f}  ({fa_frames} FA frames)")
         print(f"  {'AP@50:':<32}{ap50 * 100:.2f}%")
         print(f"  {'mAP@50:95:':<32}{map50_95 * 100:.2f}%")
         print(sep)

@@ -1,7 +1,7 @@
 ﻿"""
-Copies test images into subfolders by dominant class ID.
+Copies validation images into subfolders by dominant class ID.
 
-Output layout inside dataset/test/:
+Output layout inside dataset/validation/:
     bird/      <- class 0 is most frequent in the label
     drone/     <- class 1 is most frequent
     unknown/   <- class 2 is most frequent
@@ -16,9 +16,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-IMAGES_DIR = PROJECT_ROOT / "dataset" / "test" / "images"
-LABELS_DIR = PROJECT_ROOT / "dataset" / "test" / "labels"
-OUTPUT_DIR  = PROJECT_ROOT / "dataset" / "test"
+IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
+LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
+OUTPUT_DIR  = PROJECT_ROOT / "dataset" / "validation"
 
 CLASS_NAMES = {0: "bird", 1: "drone", 2: "unknown"}
 
@@ -44,7 +44,7 @@ for idx, img_path in enumerate(image_files, start=1):
         with open(label_path, encoding="utf-8") as f:
             for line in f:
                 parts = line.strip().split()
-                if len(parts) == 5:
+                if len(parts) >= 5:  # bbox (5) or polygon (7+)
                     class_counter[int(parts[0])] += 1
 
         if not class_counter:
