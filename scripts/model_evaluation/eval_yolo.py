@@ -43,7 +43,7 @@ MODEL_CONF_THRESH = {
 # --- Model selection ---------------------------------------------------------
 # Set a model to True to include it in evaluation, False to skip it.
 # Set RUN_ALL_MODELS = True to override and run every model regardless.
-RUN_ALL_MODELS = False
+RUN_ALL_MODELS = True
 ENABLED_MODELS = {
     "yolo8n":  False,
     "yolo8m":  False,
