@@ -42,6 +42,8 @@ import numpy as np
 from PIL import Image
 import torch
 from ultralytics import YOLO
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -49,9 +51,12 @@ from ultralytics import YOLO
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-TEST_IMAGES_DIR = PROJECT_ROOT / "dataset" / "test" / "images"
-TEST_LABELS_DIR = PROJECT_ROOT / "dataset" / "test" / "labels"
-WEIGHTS_DIR = PROJECT_ROOT / "runs" / "detect" / "weights"
+TEST_IMAGES_DIR = PROJECT_ROOT / "dataset" / "test 2" / "images"
+TEST_LABELS_DIR = PROJECT_ROOT / "dataset" / "test 2" / "labels"
+TEST_TAG = TEST_IMAGES_DIR.parent.name.replace(" ", "")  # e.g. "test2"
+DETECT_DIR = PROJECT_ROOT / "runs" / "detect"
+WEIGHTS_DIR = DETECT_DIR / "weights"
+FASTERRCNN_TRAIN_DIR = PROJECT_ROOT / "runs" / "fasterrcnn" / "train"
 
 CLASS_NAMES = ["bird", "drone", "unknown"]
 N_CLASSES = len(CLASS_NAMES)
@@ -69,8 +74,8 @@ PLOT_ALPHA            = 1        # opacity of the PR curve line
 PLOT_COLORMAP         = "plasma"    # matplotlib colormap for confidence coloring
 PLOT_SMOOTH_SIGMA     = 9.0         # Gaussian smoothing sigma (0 = off)
 
-PLOT_XLIM             = (0.3, 0.9)  # (min, max) for the Recall axis
-PLOT_YLIM             = (0.5, 1.05) # (min, max) for the Precision axis
+PLOT_XLIM             = (0.0, 1.0)  # (min, max) for the Recall axis
+PLOT_YLIM             = (0.0, 1.05) # (min, max) for the Precision axis
 
 PLOT_XLABEL_FONTSIZE  = 20
 PLOT_YLABEL_FONTSIZE  = 20
@@ -274,7 +279,7 @@ def load_or_create_cache(
     image_paths: list,
     label_paths: list,
 ) -> list:
-    cache_path = WEIGHTS_DIR / f"pred_cache_{model_name}_test_imgsz{IMGSZ}.json"
+    cache_path = WEIGHTS_DIR / f"pred_cache_{model_name}_{TEST_TAG}_imgsz{IMGSZ}.json"
     if cache_path.exists():
         try:
             print(f"  Loading test cache: {cache_path.name}")
@@ -397,7 +402,7 @@ def sweep_pr_curve(precomputed: list, conf_values: np.ndarray) -> tuple:
 
 def _sweep_cache_path(model_name: str, steps: int, conf_min: float, conf_max: float) -> Path:
     tag = f"steps{steps}_cmin{conf_min:.3f}_cmax{conf_max:.3f}".replace(".", "p")
-    return WEIGHTS_DIR / f"sweep_cache_{model_name}_test_{tag}.npz"
+    return WEIGHTS_DIR / f"sweep_cache_{model_name}_{TEST_TAG}_{tag}.npz"
 
 
 def load_sweep_cache(
@@ -520,8 +525,8 @@ def plot_and_save(
         ax.legend(loc="lower left", fontsize=10, framealpha=0.85)
 
     # --- Axes ---
-    ax.set_xlim(0.3, 0.9)
-    ax.set_ylim(0.5, 1.05)
+    ax.set_xlim(*PLOT_XLIM)
+    ax.set_ylim(*PLOT_YLIM)
     ax.set_xlabel("Recall", fontsize=13)
     ax.set_ylabel("Precision", fontsize=13)
     ax.set_title(
@@ -548,7 +553,12 @@ def plot_and_save(
 # ---------------------------------------------------------------------------
 
 def discover_models(requested: str | None) -> list:
-    all_models = {p.stem: p for p in sorted(WEIGHTS_DIR.glob("*.pt"))}
+    """Find YOLO models from runs/detect/weights/*.pt (excluding '_2' variants and fasterrcnn)."""
+    all_models = {
+        p.stem: p
+        for p in sorted(WEIGHTS_DIR.glob("*.pt"))
+        if "_2" not in p.stem and p.stem != "fasterrcnn"
+    }
     if not all_models:
         raise FileNotFoundError(f"No .pt files found in {WEIGHTS_DIR}")
     if requested:
@@ -558,6 +568,112 @@ def discover_models(requested: str | None) -> list:
     ordered = [(n, all_models[n]) for n in MODEL_ORDER if n in all_models]
     extras = [(n, all_models[n]) for n in sorted(all_models) if n not in MODEL_ORDER]
     return ordered + extras
+
+
+# ---------------------------------------------------------------------------
+# Faster R-CNN helpers
+# ---------------------------------------------------------------------------
+
+def _load_fasterrcnn(checkpoint_path: Path, device: str):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    cls_weight = checkpoint["model_state_dict"]["roi_heads.box_predictor.cls_score.weight"]
+    num_classes = cls_weight.shape[0]
+    model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    model.to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    return model
+
+
+def _infer_fasterrcnn_image(model, image_path: Path, device: str) -> list:
+    image = Image.open(image_path).convert("RGB")
+    tensor = (
+        torch.from_numpy(np.array(image, dtype="uint8"))
+        .permute(2, 0, 1).float().div(255.0).to(device)
+    )
+    with torch.no_grad():
+        pred = model([tensor])[0]
+    results = []
+    for box, label, score in zip(
+        pred["boxes"].cpu().numpy(),
+        pred["labels"].cpu().numpy(),
+        pred["scores"].cpu().numpy(),
+    ):
+        shifted = int(label) - 1  # torchvision: 0=background -> shift to 0=bird
+        cls = shifted if shifted in (0, 1) else 2
+        results.append((float(score), cls, [float(v) for v in box]))
+    return results
+
+
+def _build_test_cache_fasterrcnn(
+    checkpoint_path: Path,
+    image_paths: list,
+    label_paths: list,
+    cache_path: Path,
+    device: str,
+) -> list:
+    print(f"  Loading FasterRCNN weights: {checkpoint_path.name}")
+    model = _load_fasterrcnn(checkpoint_path, device)
+    total = len(image_paths)
+    cached: list = []
+    t0 = time.time()
+    for idx, (ip, lp) in enumerate(zip(image_paths, label_paths), 1):
+        gt_boxes_xywh, gt_labels = load_label_file(lp)
+        with Image.open(ip) as img:
+            width, height = img.size
+        gt_boxes_xyxy = [xywhn_to_xyxy(b, width, height) for b in gt_boxes_xywh]
+        preds = _infer_fasterrcnn_image(model, ip, device)
+        cached.append({"gt_boxes": gt_boxes_xyxy, "gt_labels": gt_labels, "preds": preds})
+        elapsed = time.time() - t0
+        h, rem = divmod(int(elapsed), 3600)
+        m, s = divmod(rem, 60)
+        _status(f"  Caching {idx}/{total} ({idx / total * 100:.1f}%)  |  elapsed {h}:{m:02d}:{s:02d}")
+    _status_end()
+    del model
+    torch.cuda.empty_cache()
+    tmp = cache_path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(cached, f)
+    tmp.replace(cache_path)
+    print(f"  Saved FasterRCNN test cache: {cache_path.name}  ({total} images)")
+    return cached
+
+
+def load_or_create_cache_fasterrcnn(
+    checkpoint_path: Path,
+    image_paths: list,
+    label_paths: list,
+    device: str,
+) -> list:
+    cache_path = WEIGHTS_DIR / f"pred_cache_fasterrcnn_{TEST_TAG}_imgsz640.json"
+    if cache_path.exists():
+        try:
+            print(f"  Loading FasterRCNN test cache: {cache_path.name}")
+            with cache_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            print(f"  Cache ready  ({len(data)} images)")
+            return data
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"  [WARN] Cache corrupt ({exc}) — re-running inference")
+            cache_path.unlink(missing_ok=True)
+    return _build_test_cache_fasterrcnn(checkpoint_path, image_paths, label_paths, cache_path, device)
+
+
+def _fasterrcnn_best_conf() -> float | None:
+    best_json = FASTERRCNN_TRAIN_DIR.parent / "tune_f1" / "best_fasterrcnn_f1.json"
+    if not best_json.exists():
+        return None
+    try:
+        with best_json.open(encoding="utf-8") as f:
+            entries = json.load(f)
+        if isinstance(entries, list) and entries:
+            best = max(entries, key=lambda x: x.get("f1", 0.0))
+            return float(best["conf_thresh"])
+    except (json.JSONDecodeError, OSError, KeyError, ValueError):
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +758,41 @@ def main() -> None:
         plot_and_save(model_name, conf_values, macro_P, macro_R, ap, best_conf,
                       smooth_sigma=args.smooth)
         print()
+
+    # --- Faster R-CNN ---
+    if args.model is None or args.model == "fasterrcnn":
+        frcnn_pt = FASTERRCNN_TRAIN_DIR / "best.pt"
+        if frcnn_pt.exists():
+            print(f"\n{'=' * 70}")
+            print(f"  Model: fasterrcnn  ({frcnn_pt.name})")
+            print(f"{'=' * 70}")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            frcnn_cached = load_or_create_cache_fasterrcnn(frcnn_pt, image_paths, label_paths, device)
+            frcnn_best_conf = _fasterrcnn_best_conf()
+            if frcnn_best_conf is not None:
+                print(f"  Best conf (from JSON): {frcnn_best_conf:.4f}")
+            else:
+                print("  [INFO] No best conf JSON — star marker will be skipped")
+            frcnn_sweep = load_sweep_cache("fasterrcnn", args.steps, args.conf_min, args.conf_max)
+            if frcnn_sweep is not None:
+                frcnn_confs, frcnn_P, frcnn_R = frcnn_sweep
+            else:
+                print("  Precomputing IoU matrices...")
+                frcnn_precomputed = precompute_iou_matrices(frcnn_cached)
+                print(f"  Sweeping {args.steps} confidence thresholds...")
+                frcnn_P, frcnn_R = sweep_pr_curve(frcnn_precomputed, conf_values)
+                frcnn_confs = conf_values
+                save_sweep_cache("fasterrcnn", args.steps, args.conf_min, args.conf_max,
+                                 frcnn_confs, frcnn_P, frcnn_R)
+            frcnn_ap = compute_ap(frcnn_R, frcnn_P)
+            ap_summary["fasterrcnn"] = frcnn_ap
+            print(f"  AP (macro-avg, test set): {frcnn_ap:.4f}")
+            print("  Generating plots...")
+            plot_and_save("fasterrcnn", frcnn_confs, frcnn_P, frcnn_R, frcnn_ap,
+                          frcnn_best_conf, smooth_sigma=args.smooth)
+            print()
+        else:
+            print(f"\n[SKIP] fasterrcnn: {frcnn_pt} not found")
 
     # Final AP ranking
     print(f"{'=' * 70}")
