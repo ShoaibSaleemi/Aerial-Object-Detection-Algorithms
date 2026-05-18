@@ -18,9 +18,9 @@ if __name__ == "__main__":
     # 1. Load a model
     # model = YOLO("yolov8n.yaml")  # build a new model from YAML (from scratch, not pretrained)
     # model = YOLO("yolov8n.yaml").load("yolo8n.pt")  # build from YAML and transfer weights
-    model = YOLO(str(PROJECT_ROOT / "yolo26n.pt"))  # pretrained yolo26 nano
+    model = YOLO(str(PROJECT_ROOT / "yolov10n.pt"))  # pretrained yolo10 nano
 
-    run_name = unique_run_name("yolo26n", PROJECT_ROOT / "runs" / "detect")
+    run_name = unique_run_name("yolo10n", PROJECT_ROOT / "runs" / "detect")
 
     # 2. Train the model, https://docs.ultralytics.com/modes/train/#musgd-optimizer
     results = model.train(
@@ -29,7 +29,7 @@ if __name__ == "__main__":
         epochs=50, # pass over the entire dataset, affect training duration and model performance
         imgsz=640, # input image size is 1024, but resized to 640 for training
         batch=8,
-        workers=0, # avoid Windows shared-memory mapping failures in multi-worker dataloading
+        workers=2, # avoid Windows shared-memory mapping failures in multi-worker dataloading
         save=True, # save the training checkpoints
         save_period=1, # frequency of saving a checkpoint, specified in epochs
         optimizer="SGD",

@@ -5,7 +5,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 label_dirs = [
-    str(PROJECT_ROOT / "dataset" / "test" / "labels")
+    str(PROJECT_ROOT / "dataset" / "test 2" / "labels")
 ]
 
 # Count only .txt files for progress tracking

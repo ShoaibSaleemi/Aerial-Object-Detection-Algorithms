@@ -44,7 +44,7 @@ CONF_INFER = 0.001
 IOU_THRESH = 0.5
 IMGSZ = 640
 
-TARGET_MODELS = {"yolo8m"}
+TARGET_MODELS: set[str] = set()  # empty = evaluate all discovered models
 IMAGE_EXTENSIONS = [".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff"]
 
 _INLINE_STATUS_LEN = 0
@@ -152,16 +152,24 @@ def find_validation_pairs(images_dir: Path, labels_dir: Path) -> tuple[list[Path
 
 
 def discover_models(runs_dir: Path) -> list[tuple[str, Path]]:
-    models = []
-    for best_path in sorted(runs_dir.glob("*/weights/best.pt")):
-        model_name = best_path.parent.parent.name
-        models.append((model_name, best_path))
+    flat_weights_dir = runs_dir / "weights"
+    if not flat_weights_dir.is_dir():
+        raise FileNotFoundError(f"Weights directory not found: {flat_weights_dir}")
+    models = [(pt_path.stem, pt_path) for pt_path in sorted(flat_weights_dir.glob("*.pt"))]
+    if not models:
+        raise FileNotFoundError(
+            f"No model checkpoints found in {flat_weights_dir}. "
+            "Ensure runs/detect/weights/<model>.pt exists."
+        )
     return models
 
 
 # ---------------------------------------------------------------------------
 # AP computation
 # ---------------------------------------------------------------------------
+
+IOU_THRESHOLDS_95 = np.linspace(0.5, 0.95, 10)  # [0.50, 0.55, ..., 0.95]
+
 
 def compute_ap_101(recalls: np.ndarray, precisions: np.ndarray) -> float:
     """101-point COCO-style interpolated Average Precision."""
@@ -173,35 +181,57 @@ def compute_ap_101(recalls: np.ndarray, precisions: np.ndarray) -> float:
     return ap
 
 
-def compute_map50(
-    model,
+# ---------------------------------------------------------------------------
+# Prediction cache
+# ---------------------------------------------------------------------------
+
+def load_or_build_cache(
+    model_name: str,
+    model_path: Path,
     image_paths: list[Path],
     valid_label_paths: list[Path],
     start_time: float,
-) -> tuple[float, list[dict]]:
+) -> list[dict]:
     """
-    Run inference at CONF_INFER on all validation images and compute mAP@0.5.
+    Load cached predictions from disk (shared with tune_yolo_f1.py), or run
+    inference and save them.
 
-    Returns:
-        map50            : float — mean AP across classes that have GT
-        per_class_results: list of dicts — {class, n_gt, ap}
+    Cache file: <model_path.parent>/pred_cache_<model_name>_imgsz<IMGSZ>.json
+    Format (same as tune_yolo_f1.py): list of per-image dicts:
+        [{"gt_boxes": [[x1,y1,x2,y2],...], "gt_labels": [int,...],
+          "preds": [[conf, cls_id, [x1,y1,x2,y2]], ...]}, ...]
     """
+    cache_filename = f"pred_cache_{model_name}_imgsz{IMGSZ}.json"
+    cache_path = model_path.parent / cache_filename
     total_files = len(image_paths)
 
-    # per_class_preds[c] = list of (confidence, is_tp:int)
-    per_class_preds: list[list[tuple[float, int]]] = [[] for _ in range(N_CLASSES)]
-    per_class_n_gt = [0] * N_CLASSES
+    # ---- Try loading existing cache ----
+    if cache_path.exists():
+        try:
+            with cache_path.open("r", encoding="utf-8") as f:
+                cache = json.load(f)
+            if isinstance(cache, list):
+                print(f"  Loaded prediction cache: {cache_path}")
+                return cache
+            # Old dict-format cache — discard and regenerate
+            print(f"  [WARN] Cache has old format, regenerating: {cache_path}")
+            cache_path.unlink(missing_ok=True)
+        except json.JSONDecodeError:
+            print(f"  [WARN] Corrupt cache detected, regenerating: {cache_path}")
+            cache_path.unlink(missing_ok=True)
+
+    # ---- Run inference ----
+    print(f"  Running inference (conf={CONF_INFER}, imgsz={IMGSZ}) on {total_files} images...")
+    import torch
+    model = YOLO(str(model_path))
+    cache: list[dict] = []
 
     for idx, (image_path, label_path) in enumerate(zip(image_paths, valid_label_paths), 1):
-        # ---- Ground truth ----
         gt_boxes_xywh, gt_labels = load_label_file(label_path)
         with Image.open(image_path) as img:
             width, height = img.size
         gt_boxes_xyxy = [xywhn_to_xyxy(b, width, height) for b in gt_boxes_xywh]
-        for lbl in gt_labels:
-            per_class_n_gt[lbl] += 1
 
-        # ---- Inference ----
         result = model.predict(
             source=str(image_path),
             conf=CONF_INFER,
@@ -210,50 +240,18 @@ def compute_map50(
         )
         result = result[0] if isinstance(result, list) else result
 
-        pred_boxes_xyxy: list[list[float]] = []
-        pred_confs: list[float] = []
-        pred_classes: list[int] = []
-
+        preds = []
         if hasattr(result, "boxes") and len(result.boxes) > 0:
             for box, conf, cls in zip(
                 result.boxes.xyxy.cpu().numpy(),
                 result.boxes.conf.cpu().numpy(),
                 result.boxes.cls.cpu().numpy(),
             ):
-                cls_id = int(cls)
-                pred_classes.append(cls_id if cls_id in (0, 1) else 2)
-                pred_confs.append(float(conf))
-                pred_boxes_xyxy.append(list(box))
+                cls_id = int(cls) if int(cls) in (0, 1) else 2
+                preds.append([float(conf), cls_id, [float(v) for v in box]])
 
-        # ---- Per-class greedy matching ----
-        for c in range(N_CLASSES):
-            c_gt_boxes = [gt_boxes_xyxy[i] for i, lbl in enumerate(gt_labels) if lbl == c]
+        cache.append({"gt_boxes": gt_boxes_xyxy, "gt_labels": gt_labels, "preds": preds})
 
-            c_pred_items = sorted(
-                [(pred_confs[j], pred_boxes_xyxy[j]) for j in range(len(pred_classes)) if pred_classes[j] == c],
-                key=lambda x: x[0],
-                reverse=True,
-            )
-
-            matched_gt = set()
-            for conf_val, pb in c_pred_items:
-                best_iou = 0.0
-                best_gt_idx = -1
-                for gi, gb in enumerate(c_gt_boxes):
-                    if gi in matched_gt:
-                        continue
-                    iou = compute_iou(pb, gb)
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_gt_idx = gi
-
-                if best_iou >= IOU_THRESH and best_gt_idx >= 0:
-                    matched_gt.add(best_gt_idx)
-                    per_class_preds[c].append((conf_val, 1))  # TP
-                else:
-                    per_class_preds[c].append((conf_val, 0))  # FP
-
-        # ---- Progress ----
         pct = idx / total_files * 100.0
         elapsed = time.time() - start_time
         t_hour, t_rem = divmod(int(elapsed), 3600)
@@ -264,40 +262,114 @@ def compute_map50(
 
     _finish_inline_status_line()
 
-    # ---- Compute per-class AP ----
-    per_class_results = []
-    aps = []
+    # GPU cleanup
+    del model
+    torch.cuda.empty_cache()
 
-    for c in range(N_CLASSES):
+    # ---- Atomic write ----
+    tmp_path = cache_path.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(cache, f)
+    tmp_path.replace(cache_path)
+    print(f"  Saved prediction cache : {cache_path}")
+
+    return cache
+
+
+def compute_map_metrics(
+    cache: list[dict],
+) -> tuple[float, float, list[dict]]:
+    """
+    Compute mAP@0.5 and mAP@0.5-0.95 from cached predictions.
+
+    Cache format (same as tune_yolo_f1.py):
+        [{"gt_boxes": [...], "gt_labels": [...], "preds": [[conf, cls_id, [x1,y1,x2,y2]], ...]}, ...]
+
+    Returns:
+        map50            : float
+        map50_95         : float
+        per_class_results: list of dicts — {class, n_gt, ap50, ap50_95}
+    """
+    # per_class_preds[c] = list of (conf, img_idx, pred_box_xyxy)
+    per_class_preds: list[list[tuple[float, int, list[float]]]] = [[] for _ in range(N_CLASSES)]
+    # per_class_gts[c][img_idx] = list of gt_box_xyxy
+    per_class_gts: list[dict[int, list]] = [{} for _ in range(N_CLASSES)]
+    per_class_n_gt = [0] * N_CLASSES
+
+    for img_idx, entry in enumerate(cache):
+        gt_labels = entry["gt_labels"]
+        gt_boxes_xyxy = entry["gt_boxes"]
+
+        for lbl, gb in zip(gt_labels, gt_boxes_xyxy):
+            per_class_n_gt[lbl] += 1
+            per_class_gts[lbl].setdefault(img_idx, []).append(gb)
+
+        for conf, cls_id, box in entry["preds"]:
+            per_class_preds[int(cls_id)].append((float(conf), img_idx, box))
+
+    # ---- Greedy matching + AP at a given IoU threshold ----
+    def _ap_at_iou(c: int, iou_t: float) -> float | None:
         n_gt = per_class_n_gt[c]
         preds = per_class_preds[c]
-
         if n_gt == 0:
-            # No ground-truth boxes for this class — excluded from mean
-            per_class_results.append({"class": CLASS_NAMES[c], "n_gt": 0, "ap": None})
-            continue
-
+            return None
         if not preds:
-            # Model produced no predictions for this class at all
-            per_class_results.append({"class": CLASS_NAMES[c], "n_gt": n_gt, "ap": 0.0})
-            aps.append(0.0)
-            continue
+            return 0.0
 
-        preds.sort(key=lambda x: x[0], reverse=True)
-        tp_arr = np.array([p[1] for p in preds], dtype=np.float64)
-        fp_arr = 1.0 - tp_arr
+        sorted_preds = sorted(preds, key=lambda x: -x[0])
+        matched_gts: dict[int, set] = {}
+        tp_list = []
+
+        for conf, img_idx, pb in sorted_preds:
+            c_gt_boxes = per_class_gts[c].get(img_idx, [])
+            img_matched = matched_gts.setdefault(img_idx, set())
+            best_iou, best_gi = 0.0, -1
+            for gi, gb in enumerate(c_gt_boxes):
+                if gi in img_matched:
+                    continue
+                iou = compute_iou(pb, gb)
+                if iou > best_iou:
+                    best_iou, best_gi = iou, gi
+            if best_iou >= iou_t and best_gi >= 0:
+                img_matched.add(best_gi)
+                tp_list.append(1)
+            else:
+                tp_list.append(0)
+
+        tp_arr = np.array(tp_list, dtype=np.float64)
         cum_tp = np.cumsum(tp_arr)
-        cum_fp = np.cumsum(fp_arr)
-
+        cum_fp = np.cumsum(1.0 - tp_arr)
         recalls = cum_tp / n_gt
         precisions = cum_tp / (cum_tp + cum_fp)
+        return compute_ap_101(recalls, precisions)
 
-        ap = compute_ap_101(recalls, precisions)
-        aps.append(ap)
-        per_class_results.append({"class": CLASS_NAMES[c], "n_gt": n_gt, "ap": round(float(ap), 6)})
+    # ---- Compute per-class AP at all thresholds ----
+    # per_class_all_aps[c][t_idx] = AP or None
+    per_class_all_aps = [
+        [_ap_at_iou(c, float(iou_t)) for iou_t in IOU_THRESHOLDS_95]
+        for c in range(N_CLASSES)
+    ]
 
-    map50 = float(np.mean(aps)) if aps else 0.0
-    return map50, per_class_results
+    # ---- Aggregate ----
+    per_class_results = []
+    for c in range(N_CLASSES):
+        aps = per_class_all_aps[c]
+        ap50 = aps[0]  # IoU=0.5 is the first threshold
+        valid_aps = [a for a in aps if a is not None]
+        ap50_95 = float(np.mean(valid_aps)) if valid_aps else None
+        per_class_results.append({
+            "class": CLASS_NAMES[c],
+            "n_gt": per_class_n_gt[c],
+            "ap50": round(float(ap50), 6) if ap50 is not None else None,
+            "ap50_95": round(float(ap50_95), 6) if ap50_95 is not None else None,
+        })
+
+    valid_ap50 = [r["ap50"] for r in per_class_results if r["ap50"] is not None]
+    valid_ap50_95 = [r["ap50_95"] for r in per_class_results if r["ap50_95"] is not None]
+    map50 = float(np.mean(valid_ap50)) if valid_ap50 else 0.0
+    map50_95 = float(np.mean(valid_ap50_95)) if valid_ap50_95 else 0.0
+
+    return map50, map50_95, per_class_results
 
 
 # ---------------------------------------------------------------------------
@@ -319,14 +391,18 @@ def evaluate_single_model(
     print(f"  Checkpoint       : {model_path}")
     print(f"{'=' * 70}")
 
-    model = YOLO(str(model_path))
     start_time = time.time()
 
-    map50, per_class_results = compute_map50(
-        model=model,
+    cache = load_or_build_cache(
+        model_name=model_name,
+        model_path=model_path,
         image_paths=image_paths,
         valid_label_paths=valid_label_paths,
         start_time=start_time,
+    )
+
+    map50, map50_95, per_class_results = compute_map_metrics(
+        cache=cache,
     )
 
     elapsed = time.time() - start_time
@@ -337,6 +413,7 @@ def evaluate_single_model(
         "model": model_name,
         "model_path": str(model_path),
         "map_50": round(map50, 6),
+        "map_50_95": round(map50_95, 6),
         "per_class": per_class_results,
         "eval_time_seconds": round(elapsed, 1),
     }
@@ -346,12 +423,14 @@ def evaluate_single_model(
     with output_json.open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
 
-    print(f"  mAP@0.5 : {map50:.4f}")
+    print(f"  mAP@0.5     : {map50:.4f}")
+    print(f"  mAP@0.5-0.95: {map50_95:.4f}")
     for pc in per_class_results:
-        ap_str = f"{pc['ap']:.4f}" if pc["ap"] is not None else "N/A (no GT)"
-        print(f"    {pc['class']:10s}: AP={ap_str}  n_gt={pc['n_gt']}")
-    print(f"  Time    : {t_hour}:{t_min:02d}:{t_sec:02d}")
-    print(f"  Saved   : {output_json}")
+        ap50_str = f"{pc['ap50']:.4f}" if pc["ap50"] is not None else "N/A"
+        ap95_str = f"{pc['ap50_95']:.4f}" if pc["ap50_95"] is not None else "N/A"
+        print(f"    {pc['class']:10s}: AP50={ap50_str}  AP50-95={ap95_str}  n_gt={pc['n_gt']}")
+    print(f"  Time        : {t_hour}:{t_min:02d}:{t_sec:02d}")
+    print(f"  Saved       : {output_json}")
 
     return result
 
@@ -396,18 +475,14 @@ def main() -> None:
     discovered_models = discover_models(RUNS_DIR)
 
     if args.model is not None:
-        if args.model not in TARGET_MODELS:
-            print(f"  [WARN] '{args.model}' is not in the default target set {sorted(TARGET_MODELS)}, evaluating anyway.")
-        target_set = {args.model}
-    else:
-        target_set = TARGET_MODELS
-
-    discovered_models = [(n, p) for n, p in discovered_models if n in target_set]
+        discovered_models = [(n, p) for n, p in discovered_models if n == args.model]
+    elif TARGET_MODELS:
+        discovered_models = [(n, p) for n, p in discovered_models if n in TARGET_MODELS]
 
     if not discovered_models:
         raise RuntimeError(
-            f"No matching checkpoints found for {target_set}. "
-            "Ensure runs/detect/<model_name>/weights/best.pt exists."
+            f"No matching checkpoints found in {RUNS_DIR / 'weights'}. "
+            "Ensure runs/detect/weights/<model>.pt exists."
         )
 
     print(f"  {len(discovered_models)} model(s) to evaluate:")
@@ -453,10 +528,14 @@ def main() -> None:
     ranking = sorted(all_results.items(), key=lambda kv: kv[1]["map_50"], reverse=True)
 
     print(f"\n{'=' * 70}")
-    print("  mAP@0.5 Ranking")
+    print("  mAP Ranking")
     print(f"{'=' * 70}")
+    print(f"  {'Model':<15}  {'mAP@0.5':>10}  {'mAP@0.5-0.95':>14}")
+    print(f"  {'-'*15}  {'-'*10}  {'-'*14}")
     for rank, (model_name, res) in enumerate(ranking, 1):
-        print(f"  {rank}. {model_name:12s}  mAP@0.5 = {res['map_50']:.4f}")
+        print(
+            f"  {rank}. {model_name:<13}  {res['map_50']:>10.4f}  {res['map_50_95']:>14.4f}"
+        )
     print(f"{'=' * 70}\n")
 
 
