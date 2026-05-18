@@ -22,14 +22,14 @@ random.seed(0)
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
 # Toggle between validation and test dataset
-USE_TEST_DATASET = True  # Set to True to evaluate on test dataset, False for validation
+USE_TEST_DATASET = False  # Set to True to evaluate on test dataset, False for validation
 
 # Edit evaluation parameters here.
 DATASET_SPLIT = "test" if USE_TEST_DATASET else "validation"
 IMAGES_DIR = PROJECT_ROOT / "dataset" / DATASET_SPLIT / "images"
 LABELS_DIR = PROJECT_ROOT / "dataset" / DATASET_SPLIT / "labels"
 IOU_THRESH = 0.5
-CONF_THRESH = 0.60
+CONF_THRESH = 0.70
 MODEL_CONF_THRESH = {
     "yolo8n": 0.6863484706628682,
     "yolo8m": 0.7133918823950539,
@@ -308,8 +308,12 @@ def build_confusion_matrix(results, label_paths, images_dir, iou_thresh, verbose
 
 
 def plot_confusion(matrix, save_path, title_prefix):
+    col_sums = matrix.sum(axis=0, keepdims=True).astype(float)
+    col_sums[col_sums == 0] = 1
+    display_matrix = matrix.astype(float) / col_sums * 100.0
+
     fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(matrix, cmap="Blues")
+    im = ax.imshow(display_matrix, cmap="Blues")
 
     ax.set_xticks(np.arange(len(CLASS_NAMES)))
     ax.set_yticks(np.arange(len(CLASS_NAMES)))
@@ -320,11 +324,11 @@ def plot_confusion(matrix, save_path, title_prefix):
 
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
-            text_color = "white" if i == 2 and j == 2 else "black"
+            text_color = "white" if i == j else "black"
             ax.text(
                 j,
                 i,
-                matrix[i, j],
+                f"{display_matrix[i, j]:.1f}",
                 ha="center",
                 va="center",
                 color=text_color,

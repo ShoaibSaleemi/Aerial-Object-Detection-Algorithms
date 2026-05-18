@@ -16,10 +16,22 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-SPLITS = {
-    "train":      PROJECT_ROOT / "dataset" / "train"      / "labels",
-    "validation": PROJECT_ROOT / "dataset" / "validation" / "labels",
-    "test":       PROJECT_ROOT / "dataset" / "test"       / "labels",
+ALL_SPLITS = {
+    "train":      PROJECT_ROOT / "dataset 2" / "train"      / "labels",
+    "validation": PROJECT_ROOT / "dataset 2" / "validation" / "labels",
+    "test":       PROJECT_ROOT / "dataset 2" / "test"   / "labels",
+}
+
+# Set RUN_ALL_SPLITS = True to scan every split regardless of the flags below.
+RUN_ALL_SPLITS = False
+ENABLED_SPLITS = {
+    "train":      False,
+    "validation": False,
+    "test":       True,
+}
+
+SPLITS = ALL_SPLITS if RUN_ALL_SPLITS else {
+    k: v for k, v in ALL_SPLITS.items() if ENABLED_SPLITS.get(k, False)
 }
 
 KNOWN_CLASSES = {0, 1, 2}
