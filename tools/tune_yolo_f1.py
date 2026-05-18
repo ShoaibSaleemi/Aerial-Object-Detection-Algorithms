@@ -26,6 +26,7 @@ import numpy as np
 import optuna
 from optuna.samplers import TPESampler
 from PIL import Image
+import torch
 from ultralytics import YOLO
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -280,9 +281,11 @@ def find_validation_pairs(images_dir: Path, labels_dir: Path) -> tuple[list[Path
 
 def discover_models(runs_dir: Path) -> list[tuple[str, Path]]:
     models = []
-    for best_path in sorted(runs_dir.glob("*/weights/best.pt")):
-        model_name = best_path.parent.parent.name
-        models.append((model_name, best_path))
+    flat_weights_dir = runs_dir / "weights"
+    if not flat_weights_dir.is_dir():
+        raise FileNotFoundError(f"Weights directory not found: {flat_weights_dir}")
+    for pt_path in sorted(flat_weights_dir.glob("*.pt")):
+        models.append((pt_path.stem, pt_path))
     return models
 
 
@@ -326,7 +329,7 @@ def cache_model_predictions(
                 pred_entries.append((
                     float(conf),
                     cls_id if cls_id in (0, 1) else 2,
-                    list(box),
+                    [float(v) for v in box],
                 ))
 
         cached.append({"gt_boxes": gt_boxes_xyxy, "gt_labels": gt_labels, "preds": pred_entries})
@@ -522,16 +525,17 @@ def tune_single_model(
     print(f"  Checkpoint : {model_path}")
     print(f"{'=' * 70}")
 
-    db_path = OUTPUT_DIR / f"optuna_{model_name}.db"
-    best_json_path = OUTPUT_DIR / f"best_{model_name}.json"
+    output_dir = model_path.parent
+    db_path = output_dir / f"optuna_{model_name}.db"
+    best_json_path = output_dir / f"best_{model_name}.json"
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     storage = optuna.storages.RDBStorage(f"sqlite:///{db_path}")
     study_name = f"yolo_threshold_{model_name}"
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    try:
+    existing_studies = {s.study_name for s in optuna.get_all_study_summaries(storage=storage)}
+    if study_name in existing_studies:
         study = optuna.load_study(study_name=study_name, storage=storage)
 
         # Mark any trials left in RUNNING state (interrupted mid-trial) as FAILED
@@ -543,31 +547,40 @@ def tune_single_model(
         if running_trials:
             print(f"  [RESUME] Found {len(running_trials)} interrupted trial(s) — marking as FAILED so they are retried.")
             for t in running_trials:
-                storage.set_trial_state_values(t._trial_id, state=optuna.trial.TrialState.FAIL)
+                try:
+                    storage.set_trial_state_values(t._trial_id, state=optuna.trial.TrialState.FAIL)
+                except Exception:
+                    pass  # stale trial ID; ignore
 
         completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
         print(f"  [RESUME] Found existing study with {len(completed_trials)} completed trial(s).")
         best_trial = _safe_best_trial(study)
         if best_trial is not None:
             print(f"           Best F1 score so far: {-best_trial.value:.4f}")
-        start_trial = len(completed_trials) + 1
-    except KeyError:
+    else:
         # Derive a unique seed per model so each model explores a different
         # initial random sequence even when the same base seed is used.
         model_seed = (seed + hash(model_name)) % (2**31)
-        # n_startup_trials controls how many random trials run before the TPE
-        # probabilistic model takes over.  Default is 25, which wastes half
-        # the budget when --trials=50.  5 random points are enough to seed
-        # the model for a single 1-D parameter like conf_thresh.
-        sampler = TPESampler(seed=model_seed, n_startup_trials=5)
+
+        # Warm-start: enqueue a uniform grid so the first n_warmup trials
+        # spread evenly across [min_conf, max_conf].  TPE then has a full
+        # landscape picture before it starts exploiting the best region,
+        # preventing it from clustering around bad areas early on.
+        n_warmup = 20
+        sampler = TPESampler(
+            seed=model_seed,
+            n_startup_trials=n_warmup,  # treat the grid as the random phase
+            n_ei_candidates=100,        # more candidates → smarter exploitation
+        )
         study = optuna.create_study(
             study_name=study_name,
             storage=storage,
             sampler=sampler,
             direction="minimize",
         )
-        print(f"  [NEW] Starting fresh optimization study (sampler seed: {model_seed})")
-        start_trial = 1
+        for conf_val in np.linspace(min_conf, max_conf, n_warmup):
+            study.enqueue_trial({"conf_thresh": float(conf_val)})
+        print(f"  [NEW] Starting fresh study (seed: {model_seed}, {n_warmup} warm-start grid points)")
 
     n_complete = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE)
 
@@ -598,7 +611,8 @@ def tune_single_model(
 
     print(f"\nStarting optimization ({trials} trials, resuming from trial {n_complete + 1})...\n")
 
-    model = YOLO(str(model_path))
+    disk_cache_path = model_path.parent / f"pred_cache_{model_name}_imgsz{IMGSZ}.json"
+    model = None if disk_cache_path.exists() else YOLO(str(model_path))
     tracker = OptimizationTracker(start_time=time.time())
 
     best_trial = _safe_best_trial(study)
@@ -607,9 +621,32 @@ def tune_single_model(
         tracker.best_f1 = prior_best_f1
         print(f"  [RESUME] Seeding tracker with prior best F1: {prior_best_f1:.4f}")
 
-    print("  Caching inference results (one-time pass at conf=0.001)...")
-    cached_data = cache_model_predictions(model, image_paths, valid_label_paths, tracker.start_time)
-    print(f"  Cache ready ({len(cached_data)} images). Starting Optuna trials...\n")
+    disk_cache_path = model_path.parent / f"pred_cache_{model_name}_imgsz{IMGSZ}.json"
+    cached_data = None
+    if disk_cache_path.exists():
+        try:
+            print(f"  Loading cached predictions from disk: {disk_cache_path.name}")
+            with disk_cache_path.open("r", encoding="utf-8") as f:
+                cached_data = json.load(f)
+            print(f"  Cache ready ({len(cached_data)} images). Starting Optuna trials...\n")
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"  [WARN] Cache file corrupt ({exc}), re-running inference...")
+            disk_cache_path.unlink(missing_ok=True)
+            cached_data = None
+
+    if cached_data is None:
+        if model is None:
+            model = YOLO(str(model_path))
+        print("  Caching inference results (one-time pass at conf=0.001)...")
+        cached_data = cache_model_predictions(model, image_paths, valid_label_paths, tracker.start_time)
+        del model
+        torch.cuda.empty_cache()
+        # Write atomically: write to a temp file then rename to avoid partial writes.
+        tmp_path = disk_cache_path.with_suffix(".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(cached_data, f)
+        tmp_path.replace(disk_cache_path)
+        print(f"  Cache saved to {disk_cache_path.name} ({len(cached_data)} images). Starting Optuna trials...\n")
 
     def on_trial_complete(study_obj: optuna.Study, _trial: optuna.trial.FrozenTrial) -> None:
         save_best_json_snapshot(study_obj, best_json_path, model_name, model_path, db_path, trials)
@@ -633,12 +670,14 @@ def tune_single_model(
         return f1_neg
 
     n_complete = sum(1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE)
-    study.optimize(
-        objective,
-        n_trials=trials - n_complete,
-        show_progress_bar=False,
-        callbacks=[on_trial_complete],
-    )
+    remaining = max(0, trials - n_complete)
+    if remaining > 0:
+        study.optimize(
+            objective,
+            n_trials=remaining,
+            show_progress_bar=False,
+            callbacks=[on_trial_complete],
+        )
 
     tracker.finalize()
 
@@ -680,10 +719,10 @@ def tune_single_model(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Bayesian optimization for per-model YOLO confidence threshold")
-    parser.add_argument("--trials", type=int, default=50, help="Number of optimization trials per model")
+    parser.add_argument("--trials", type=int, default=200, help="Number of optimization trials per model")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--model", type=str, default="yolo8n", help="Only tune one model name (run folder name)")
-    parser.add_argument("--min-conf", type=float, default=0.55, help="Lower bound for confidence threshold")
+    parser.add_argument("--model", type=str, default=None, help="Only tune one model name (run folder name); omit to tune all discovered models")
+    parser.add_argument("--min-conf", type=float, default=0.05, help="Lower bound for confidence threshold")
     parser.add_argument("--max-conf", type=float, default=0.75, help="Upper bound for confidence threshold")
     args = parser.parse_args()
 
