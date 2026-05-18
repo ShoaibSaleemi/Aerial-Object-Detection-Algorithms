@@ -22,7 +22,7 @@ random.seed(0)
 CLASS_NAMES = ["bird", "drone", "unknown"]
 
 # Toggle between validation and test dataset
-USE_TEST_DATASET = True  # Set to True to evaluate on test dataset, False for validation
+USE_TEST_DATASET = False  # Set to True to evaluate on test dataset, False for validation
 
 # Edit evaluation parameters here.
 DATASET_SPLIT = "test" if USE_TEST_DATASET else "validation"
@@ -30,7 +30,30 @@ IMAGES_DIR = PROJECT_ROOT / "dataset" / DATASET_SPLIT / "images"
 LABELS_DIR = PROJECT_ROOT / "dataset" / DATASET_SPLIT / "labels"
 IOU_THRESH = 0.5
 CONF_THRESH = 0.70
-USE_MODEL_CONF_THRESH = True  # True = load per-model conf from best_<model>.json; False = use CONF_THRESH for all
+MODEL_CONF_THRESH = {
+    "yolo8n": 0.6863484706628682,
+    "yolo8m": 0.7133918823950539,
+    "yolo9t": 0.6724046133517759,
+    "yolo10n": 0.5910035105688879,
+    "yolo11n": 0.712997868833143,
+    "yolo12n": 0.6838702654977842,
+    "yolo26n": 0.6052508580184951,
+}
+
+# --- Model selection ---------------------------------------------------------
+# Set a model to True to include it in evaluation, False to skip it.
+# Set RUN_ALL_MODELS = True to override and run every model regardless.
+RUN_ALL_MODELS = True
+ENABLED_MODELS = {
+    "yolo8n":  False,
+    "yolo8m":  False,
+    "yolo9t":  False,
+    "yolo10n": False,
+    "yolo11n": False,
+    "yolo12n": False,
+    "yolo26n": False,
+}
+# -----------------------------------------------------------------------------
 
 IMGSZ = 640
 
@@ -41,10 +64,9 @@ PREDICTED_LABEL_PAD = -14   # Distance (points) between "Predicted" label and th
 
 SAVE_PLOT = True
 VERBOSE = False  # Print per-image matching/debug details during evaluation when True.
-CONFUSION_MATRIX_SHOW_COUNTS = False  # True = raw counts; False = percentages (normalised by ground-truth column totals)
 
 # Folder where evaluation outputs (confusion matrix PNGs, CSV) are saved.
-EVAL_OUTPUT_DIR = PROJECT_ROOT / "runs" / "detect" / "weights"
+EVAL_OUTPUT_DIR = PROJECT_ROOT / "runs" / "eval_yolo"
 
 
 def build_cache_file_path(detect_run_dir: Path, conf_thresh: float, iou_thresh: float, imgsz: int, split: str) -> Path:
@@ -286,12 +308,9 @@ def build_confusion_matrix(results, label_paths, images_dir, iou_thresh, verbose
 
 
 def plot_confusion(matrix, save_path, title_prefix):
-    if CONFUSION_MATRIX_SHOW_COUNTS:
-        display_matrix = matrix.astype(float)
-    else:
-        col_sums = matrix.sum(axis=0, keepdims=True).astype(float)
-        col_sums[col_sums == 0] = 1  # avoid division by zero
-        display_matrix = matrix.astype(float) / col_sums * 100.0
+    col_sums = matrix.sum(axis=0, keepdims=True).astype(float)
+    col_sums[col_sums == 0] = 1
+    display_matrix = matrix.astype(float) / col_sums * 100.0
 
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(display_matrix, cmap="Blues")
@@ -306,14 +325,10 @@ def plot_confusion(matrix, save_path, title_prefix):
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
             text_color = "white" if i == j else "black"
-            if CONFUSION_MATRIX_SHOW_COUNTS:
-                cell_text = str(int(display_matrix[i, j]))
-            else:
-                cell_text = f"{display_matrix[i, j]:.1f}"
             ax.text(
                 j,
                 i,
-                cell_text,
+                f"{display_matrix[i, j]:.1f}",
                 ha="center",
                 va="center",
                 color=text_color,
@@ -458,43 +473,30 @@ def save_metrics_table_csv(per_class_metrics, macro_metrics, save_path):
 
 
 def main():
-    weights_dir = PROJECT_ROOT / "runs" / "detect" / "weights"
-    if not weights_dir.exists():
-        raise FileNotFoundError(f"Weights directory not found: {weights_dir}")
+    detect_root_dir = PROJECT_ROOT / "runs" / "detect"
+    available_runs = [path.name for path in detect_root_dir.iterdir() if path.is_dir()]
 
-    pt_files = sorted(weights_dir.glob("*.pt"))
-    if not pt_files:
-        raise ValueError(f"No .pt files found in {weights_dir}")
+    if len(available_runs) == 0:
+        raise ValueError(f"No folders found in {detect_root_dir}")
 
     MODEL_ORDER = ["yolo8n", "yolo8m", "yolo9t", "yolo10n", "yolo11n", "yolo12n", "yolo26n"]
-    all_discovered = {pt.stem: pt for pt in pt_files}
 
     if len(sys.argv) > 1:
-        requested = sys.argv[1]
-        if requested not in all_discovered:
-            raise ValueError(f"No '{requested}.pt' found in {weights_dir}")
-        selected = [requested]
+        run_names = [sys.argv[1]]
+        if run_names[0] not in available_runs:
+            available_text = ", ".join(available_runs)
+            raise ValueError(
+                f"Unknown folder '{run_names[0]}'. Choose one from runs/detect: {available_text}"
+            )
+    elif RUN_ALL_MODELS:
+        run_names = [r for r in MODEL_ORDER if r in available_runs] + \
+                    [r for r in sorted(available_runs) if r not in MODEL_ORDER]
     else:
-        selected = [n for n in MODEL_ORDER if n in all_discovered] + \
-                   [n for n in sorted(all_discovered) if n not in MODEL_ORDER]
-
-    # Resolve conf threshold — read from best_<model>.json when USE_MODEL_CONF_THRESH=True
-    model_entries: list[tuple[str, Path, float]] = []
-    for model_name in selected:
-        model_pt = all_discovered[model_name]
-        if USE_MODEL_CONF_THRESH:
-            best_json = weights_dir / f"best_{model_name}.json"
-            if best_json.exists():
-                with best_json.open(encoding="utf-8") as f:
-                    data = json.load(f)
-                conf_thresh = float(data["best"]["conf_thresh"])
-                print(f"  Loaded conf={conf_thresh:.4f} for {model_name} from {best_json.name}")
-            else:
-                conf_thresh = CONF_THRESH
-                print(f"  [WARN] No best JSON for {model_name}, using default conf={CONF_THRESH}")
-        else:
-            conf_thresh = CONF_THRESH
-        model_entries.append((model_name, model_pt, conf_thresh))
+        ordered = [r for r in MODEL_ORDER if r in available_runs and ENABLED_MODELS.get(r, False)]
+        extras = [r for r in sorted(available_runs) if r not in MODEL_ORDER and ENABLED_MODELS.get(r, False)]
+        run_names = ordered + extras
+        if not run_names:
+            raise ValueError("No models enabled. Set RUN_ALL_MODELS=True or enable at least one in ENABLED_MODELS.")
 
     label_dir = LABELS_DIR
     if not label_dir.exists():
@@ -504,7 +506,7 @@ def main():
     if len(label_paths) == 0:
         raise ValueError(f"No label files found in {label_dir}")
 
-    # Pre-build image/label pairs (shared across all models)
+    # Pre-build image/label pairs (shared across all runs)
     image_paths = []
     valid_label_paths = []
     for label_path in sorted(label_paths):
@@ -525,22 +527,26 @@ def main():
 
     all_model_rows = []  # Accumulates rows for the combined summary CSV
 
-    for model_name, model_pt, conf_thresh in model_entries:
-        # Per-model subfolder inside weights_dir keeps eval caches separated
-        cache_path = build_cache_file_path(weights_dir / model_name, conf_thresh, IOU_THRESH, IMGSZ, DATASET_SPLIT)
+    for run_name in run_names:
+        detect_run_dir = detect_root_dir / run_name
+        model_pt = detect_run_dir / "weights" / "best.pt"
+        if not model_pt.exists():
+            continue
 
         print(f"\n{'=' * 60}")
-        print(f"  Model: {model_name}  ({model_pt.name})  conf={conf_thresh:.4f}")
+        print(f"  Model: {run_name}")
         print(f"{'=' * 60}")
 
-        run_display_name = format_run_display_name(model_name)
-        save_plot_path = EVAL_OUTPUT_DIR / f"{model_name}_2.png"
-        save_metrics_csv_path = EVAL_OUTPUT_DIR / f"{model_name}_metrics.csv"
+        run_display_name = format_run_display_name(run_name)
+        conf_thresh = MODEL_CONF_THRESH.get(run_name, CONF_THRESH)
+        cache_path = build_cache_file_path(detect_run_dir, conf_thresh, IOU_THRESH, IMGSZ, DATASET_SPLIT)
+        save_plot_path = EVAL_OUTPUT_DIR / f"{run_name}.png"
+        save_metrics_csv_path = EVAL_OUTPUT_DIR / f"{run_name}_metrics.csv"
         EVAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
         cached = load_eval_cache(cache_path)
         if cached is not None:
-            print(f"Using cached evaluation for {model_name} (conf={conf_thresh:.4f})")
+            print(f"Using cached evaluation for {run_name} (conf={conf_thresh:.4f})")
             matrix = cached["matrix"]
             total_known = cached["total_known"]
             total_unknown = cached["total_unknown"]
@@ -590,7 +596,7 @@ def main():
 
             save_eval_cache(
                 cache_path=cache_path,
-                run_name=model_name,
+                run_name=run_name,
                 conf_thresh=conf_thresh,
                 iou_thresh=IOU_THRESH,
                 imgsz=IMGSZ,
@@ -624,8 +630,11 @@ def main():
         ])
 
         if SAVE_PLOT:
-            plot_confusion(matrix, save_plot_path, run_display_name)
-            print(f"Saved confusion matrix plot to {save_plot_path}")
+            if save_plot_path.exists():
+                print(f"Plot already exists, skipping: {save_plot_path.name}")
+            else:
+                plot_confusion(matrix, save_plot_path, run_display_name)
+                print(f"Saved confusion matrix plot to {save_plot_path}")
 
     # Save combined summary CSV for all models
     if all_model_rows:
@@ -650,4 +659,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

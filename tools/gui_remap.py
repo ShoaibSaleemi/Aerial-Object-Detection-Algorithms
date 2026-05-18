@@ -22,7 +22,6 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 CLASS_OPTIONS = ["0 — bird", "1 — drone", "2 — unknown"]
-CLASS_FOLDERS  = {"bird", "drone", "unknown", "no_label", "class3"}
 
 
 # ── Label resolution ──────────────────────────────────────────────────────────
@@ -47,11 +46,11 @@ def find_label_path(image_path: Path):
     except StopIteration:
         pass
 
-    # Layout 2: .../split/<class_folder>/<file>  (created by split_by_class.py)
-    if image_path.parent.name.lower() in CLASS_FOLDERS:
-        label_path = image_path.parent.parent / "labels" / (stem + ".txt")
-        if label_path.exists():
-            return label_path
+    # Layout 2: .../split/<subfolder>/<file>  (created by split_by_class.py)
+    # Works for both class-name folders (bird/drone/…) and prefix folders (20190/…)
+    label_path = image_path.parent.parent / "labels" / (stem + ".txt")
+    if label_path.exists():
+        return label_path
 
     return None
 
