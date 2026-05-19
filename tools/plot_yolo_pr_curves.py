@@ -509,7 +509,7 @@ def plot_and_save(
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
     norm = Normalize(vmin=float(conf_values.min()), vmax=float(conf_values.max()))
     lc = LineCollection(segments, cmap=PLOT_COLORMAP, norm=norm,
-                        linewidth=PLOT_LINEWIDTH, alpha=1.0, zorder=3)
+                        linewidth=PLOT_LINEWIDTH, alpha=PLOT_ALPHA, zorder=3)
     lc.set_array((conf_values[:-1] + conf_values[1:]) / 2.0)
     ax.add_collection(lc)
 
