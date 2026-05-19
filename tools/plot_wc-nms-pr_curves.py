@@ -66,13 +66,13 @@ MAX_DET    = 300
 # ---------------------------------------------------------------------------
 
 MODEL_CONF_THRESH = {
-    "yolo8n":  0.30,
-    "yolo8m":  0.30,
-    "yolo9t":  0.30,
-    "yolo10n": 0.30,
-    "yolo11n": 0.30,
-    "yolo12n": 0.30,
-    "yolo26n": 0.30,
+    "yolo8n":  0.6863484706628682,
+    "yolo8m":  0.7133918823950539,
+    "yolo9t":  0.6724046133517759,
+    "yolo10n": 0.5910035105688879,
+    "yolo11n": 0.712997868833143,
+    "yolo12n": 0.6838702654977842,
+    "yolo26n": 0.6052508580184951,
 }
 
 # ---------------------------------------------------------------------------
@@ -82,16 +82,47 @@ MODEL_CONF_THRESH = {
 MODEL_ORDER = ["yolo8n", "yolo8m", "yolo9t", "yolo10n", "yolo11n", "yolo12n", "yolo26n"]
 
 # Set RUN_ALL_MODELS = True to run every model regardless of ENABLED_MODELS.
-RUN_ALL_MODELS = True
+RUN_ALL_MODELS = False
 ENABLED_MODELS = {
     "yolo8n":  False,
-    "yolo8m":  False,
+    "yolo8m":  True,
     "yolo9t":  False,
     "yolo10n": False,
-    "yolo11n": False,
+    "yolo11n": True,
     "yolo12n": False,
-    "yolo26n": False,
+    "yolo26n": True,
 }
+
+# ---------------------------------------------------------------------------
+# Ensemble hyperparameters (from tune_wbf_3)
+# ---------------------------------------------------------------------------
+
+# Unknown-decision thresholds and model weights — loaded from tuner output if available.
+_BEST_PARAMS_JSON = PROJECT_ROOT / "runs" / "detect" / "tune_wbf_3" / "best_params_bayesian_3.json"
+_defaults = {
+    "MIN_MODEL_SUPPORT": 5,
+    "KNOWN_FUSED_CONF_THRESH": 0.68770202403814,
+    "SCORE_MARGIN_THRESH": 0.5582857958051067,
+    "DISAGREEMENT_RATIO_THRESH": 0.15223066760019896,
+    "MODEL_WEIGHTS": {
+        "yolo8n":  {"bird": 1.0173818474125131,  "drone": 1.3684375247874139,  "unknown": 1.1646555286393707},
+        "yolo8m":  {"bird": 1.0,  "drone": 1.0,  "unknown": 1.0},
+        "yolo9t":  {"bird": 1.3345783180967155,  "drone": 1.3246461700191348,  "unknown": 1.4472517946232146},
+        "yolo10n": {"bird": 0.701091472694561,   "drone": 0.9099028240616815,  "unknown": 0.718502456356537},
+        "yolo11n": {"bird": 1.3215138210731259,  "drone": 1.9403016932408828,  "unknown": 1.338899849846067},
+        "yolo12n": {"bird": 0.8035608928262429,  "drone": 1.3438739986019623,  "unknown": 1.3166024543945136},
+        "yolo26n": {"bird": 1.3364625610235248,  "drone": 1.1804482074749882,  "unknown": 1.746577505269269},
+    },
+}
+if _BEST_PARAMS_JSON.exists():
+    _loaded = json.loads(_BEST_PARAMS_JSON.read_text()).get("params", {})
+    _defaults.update({k: v for k, v in _loaded.items() if k in _defaults})
+
+MIN_MODEL_SUPPORT          = _defaults["MIN_MODEL_SUPPORT"]
+KNOWN_FUSED_CONF_THRESH    = _defaults["KNOWN_FUSED_CONF_THRESH"]
+SCORE_MARGIN_THRESH        = _defaults["SCORE_MARGIN_THRESH"]
+DISAGREEMENT_RATIO_THRESH  = _defaults["DISAGREEMENT_RATIO_THRESH"]
+MODEL_WEIGHTS              = _defaults["MODEL_WEIGHTS"]
 
 # ---------------------------------------------------------------------------
 # Plot style — edit these to change the appearance without touching the code

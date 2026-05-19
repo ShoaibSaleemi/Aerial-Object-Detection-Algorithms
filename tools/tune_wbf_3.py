@@ -29,11 +29,11 @@ from optuna.samplers import TPESampler
 
 # ── resolve paths ─────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WBF_PATH = PROJECT_ROOT / "scripts" / "algorithms" / "weighted_boxes_fusion_3.py"
+WBF_PATH = PROJECT_ROOT / "scripts" / "model_evaluation" / "eval_wbf.py"
 if not WBF_PATH.exists():
     raise FileNotFoundError(f"WBF script not found: {WBF_PATH}")
 
-_spec = importlib.util.spec_from_file_location("weighted_boxes_fusion_3", WBF_PATH)
+_spec = importlib.util.spec_from_file_location("eval_wbf", WBF_PATH)
 if _spec is None or _spec.loader is None:
     raise ImportError(f"Cannot create import spec for: {WBF_PATH}")
 wbf = importlib.util.module_from_spec(_spec)
@@ -45,6 +45,19 @@ LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
 
 BEST_JSON = PROJECT_ROOT / "runs" / "detect" / "tune_wbf_3" / "best_params_bayesian_3.json"
 OPTUNA_DB = PROJECT_ROOT / "runs" / "detect" / "tune_wbf_3" / "optuna_study_3.db"
+OUTPUT_DIR = PROJECT_ROOT / "runs" / "detect" / "tune_wbf_3"
+
+# Enable/disable models for tuning (maximum 3 enabled at a time)
+ENABLED_MODELS = {
+    "yolo8n": False,
+    "yolo8m": True,
+    "yolo9t": False,
+    "yolo10n": False,
+    "yolo11n": True,
+    "yolo12n": False,
+    "yolo26n": True,
+    "fasterrcnn": False,
+}
 
 # ── Tuning search ranges ──────────────────────────────────────────────────────
 MIN_SUPPORT_RANGE   = (1, 3)          # (min, max) int
@@ -96,12 +109,12 @@ def _patch_globals(params: dict) -> None:
 
 
 def _encode_params(min_support: int, known_conf: float, score_margin: float,
-                   disagreement: float, weights_list: list) -> dict:
+                   disagreement: float, weights_list: list, loaded_model_names: list) -> dict:
     """Convert optimization space parameters to trial parameters."""
-    # weights_list is flattened: [w_model0_class0, w_model0_class1, ..., w_model5_class2]
+    # weights_list is flattened by loaded_model_names: [w_model0_class0, w_model0_class1, ..., w_modelN_class2]
     model_weights = {}
     idx = 0
-    for model_name in MODEL_NAMES:
+    for model_name in loaded_model_names:
         model_weights[model_name] = {
             "bird": float(weights_list[idx]),
             "drone": float(weights_list[idx + 1]),
@@ -121,7 +134,8 @@ def _encode_params(min_support: int, known_conf: float, score_margin: float,
 def compute_f1_score(loaded_models: list, image_paths: list, valid_label_paths: list,
                      label: str = "", start_time: float = None) -> tuple[float, float, float, float]:
     """
-    Run inference on all validation images and return macro-averaged F1 score.
+    Run WBF inference on all validation images and cache fusion results.
+    Returns cached data for fast trials.
     """
     fused_results_per_image = []
     total_files = len(image_paths)
@@ -140,9 +154,18 @@ def compute_f1_score(loaded_models: list, image_paths: list, valid_label_paths: 
         status = f"{prefix}{idx}/{total_files} ({pct:.1f}%) | Elapsed: {elapsed_str}"
         _print_inline_status(status)
     
-    # Compute confusion matrix and metrics
+    _finish_inline_status_line()
+    return fused_results_per_image
+
+
+def compute_f1_from_cache(cached_fused_results: list, valid_label_paths: list) -> tuple[float, float, float, float]:
+    """
+    Compute macro-averaged F1 score from cached WBF fusion results.
+    Fast: no inference needed.
+    """
+    # Compute confusion matrix from cached results
     matrix, _, _ = wbf.build_confusion_matrix(
-        fused_results_per_image,
+        cached_fused_results,
         valid_label_paths,
         IMAGES_DIR,
         wbf.IOU_THRESH,
@@ -164,7 +187,6 @@ def compute_f1_score(loaded_models: list, image_paths: list, valid_label_paths: 
     else:
         f1_neg = float(-f1_score)
 
-    # Return objective value and metrics for trial reporting.
     return f1_neg, precision_score, recall_score, f1_score
 
 
@@ -172,6 +194,9 @@ def load_models() -> list:
     """Load ensemble models once."""
     loaded = []
     for model_name, model_path in wbf.MODELS:
+        if not ENABLED_MODELS.get(model_name, False):
+            print(f"  [SKIP] {model_name}: disabled")
+            continue
         if not model_path.exists():
             print(f"  [SKIP] {model_name}: not found at {model_path}")
             continue
@@ -218,7 +243,7 @@ def init_weights_from_baseline(loaded_models: list, image_paths: list,
     
     # Compute per-model per-class metrics
     weights = {}
-    for model_name in MODEL_NAMES:
+    for model_name, _, _ in loaded_models:
         model_matrix, _, _ = wbf.build_confusion_matrix(
             per_model_results[model_name],
             valid_label_paths,
@@ -336,7 +361,12 @@ def main():
     
     # Initialize weights from baseline
     print("\nBuilding optimization space...")
-    init_weights = init_weights_from_baseline(loaded_models, image_paths, valid_label_paths)
+    # Skip baseline inference - use uniform weights
+    loaded_model_names = [model_name for model_name, _, _ in loaded_models]
+    init_weights = {
+        model_name: {"bird": 1.0, "drone": 1.0, "unknown": 1.0}
+        for model_name in loaded_model_names
+    }
     
     # Build initial point with defaults
     init_params = {
@@ -347,24 +377,42 @@ def main():
     }
     
     # Add initial weights from baseline analysis
-    for model_name in MODEL_NAMES:
+    for model_name, _, _ in loaded_models:
         for class_name in CLASS_NAMES:
             init_params[f"w_{model_name}_{class_name}"] = init_weights[model_name][class_name]
     
-    # Evaluate initial point
+    # Cache WBF results or load from disk
+    cache_dir = OUTPUT_DIR / "eval_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / "wbf_fused_results_cache.json"
+    
+    if cache_file.exists():
+        print(f"\nLoading cached WBF fusion results from {cache_file.name}...")
+        with cache_file.open("r", encoding="utf-8") as f:
+            cached_fused_results = json.load(f)
+        print(f"  Loaded {len(cached_fused_results)} cached fusion results")
+    else:
+        print("\nCaching WBF fusion results (inference pass)...")
+        cached_fused_results = compute_f1_score(
+            loaded_models,
+            image_paths,
+            valid_label_paths,
+            label="Caching:",
+            start_time=time.time(),
+        )
+        # Save to disk
+        with cache_file.open("w", encoding="utf-8") as f:
+            json.dump(cached_fused_results, f)
+        print(f"  Saved cache to {cache_file.name}")
+    
+    # Evaluate initial point from cache
     opt_start_time = time.time()
-    print("Evaluating initial point...")
-    x0_weights = [init_weights[model_name][class_name] for model_name in MODEL_NAMES for class_name in CLASS_NAMES]
-    params_init = _encode_params(INIT_MIN_SUPPORT, INIT_KNOWN_CONF, INIT_SCORE_MARGIN, INIT_DISAGREEMENT, x0_weights)
+    print("\nEvaluating initial point...")
+    params_init = _encode_params(INIT_MIN_SUPPORT, INIT_KNOWN_CONF, INIT_SCORE_MARGIN, INIT_DISAGREEMENT, 
+                                  [init_weights[model_name][class_name] for model_name in loaded_model_names for class_name in CLASS_NAMES], 
+                                  loaded_model_names)
     _patch_globals(params_init)
-    y0_neg, y0_precision, y0_recall, y0_f1 = compute_f1_score(
-        loaded_models,
-        image_paths,
-        valid_label_paths,
-        label="Initial:",
-        start_time=opt_start_time,
-    )
-    _finish_inline_status_line()
+    y0_neg, y0_precision, y0_recall, y0_f1 = compute_f1_from_cache(cached_fused_results, valid_label_paths)
     print(f"  Initial Precision: {y0_precision:.4f}")
     print(f"  Initial Recall   : {y0_recall:.4f}")
     print(f"  Initial F1 score : {y0_f1:.4f}")
@@ -436,7 +484,8 @@ def main():
         best_params_obj = best_trial_obj.params
 
         model_weights_obj = {}
-        for model_name in MODEL_NAMES:
+        loaded_model_names_obj = [model_name for model_name, _, _ in loaded_models]
+        for model_name in loaded_model_names_obj:
             model_weights_obj[model_name] = {}
             for class_name in CLASS_NAMES:
                 model_weights_obj[model_name][class_name] = best_params_obj.get(
@@ -465,6 +514,29 @@ def main():
             json.dump(output_obj, f, indent=2)
 
     def on_trial_complete(study_obj: optuna.Study, _trial: optuna.trial.FrozenTrial) -> None:
+        # Update inline status with trial results
+        trial_number = _trial.number + 1
+        precision_score = _trial.user_attrs.get("precision", 0.0)
+        recall_score = _trial.user_attrs.get("recall", 0.0)
+        f1_score = -_trial.value
+        
+        is_new_best = f1_score > tracker.best_f1
+        if is_new_best:
+            tracker.best_f1 = f1_score
+            tracker.best_precision = precision_score
+            tracker.best_recall = recall_score
+        
+        RED = "\033[38;2;255;42;0m"
+        RESET = "\033[0m"
+        
+        if is_new_best:
+            status = f"Trial {trial_number}/{args.trials} | Precision: {precision_score:.4f} | Recall: {recall_score:.4f} | F1: {RED}{f1_score:.4f}{RESET} | {RED}New best ★{RESET}"
+        else:
+            status = f"Trial {trial_number}/{args.trials} | Precision: {precision_score:.4f} | Recall: {recall_score:.4f} | F1: {f1_score:.4f}"
+        
+        _print_inline_status(status)
+        print()  # New line after each trial
+        
         save_best_json_snapshot(study_obj)
     
     # Define objective function with closure
@@ -475,35 +547,28 @@ def main():
         score_margin = trial.suggest_float("score_margin", *SCORE_MARGIN_RANGE)
         disagreement = trial.suggest_float("disagreement", *DISAGREEMENT_RANGE)
         
-        # Suggest weights for each model and class
+        # Suggest weights for each loaded model and class
+        loaded_model_names = [model_name for model_name, _, _ in loaded_models]
         weights_list = []
-        for model_name in MODEL_NAMES:
+        for model_name in loaded_model_names:
             for class_name in CLASS_NAMES:
                 w = trial.suggest_float(f"w_{model_name}_{class_name}", *MODEL_WEIGHT_RANGE)
                 weights_list.append(w)
         
         # Encode and patch parameters
-        params = _encode_params(min_support, known_conf, score_margin, disagreement, weights_list)
+        params = _encode_params(min_support, known_conf, score_margin, disagreement, weights_list, loaded_model_names)
         _patch_globals(params)
         
-        # Compute F1 score (shows per-image progress inline)
-        trial_label = f"Trial {trial.number + 1}/{args.trials}:"
-        f1_neg, precision_score, recall_score, f1_score = compute_f1_score(
-            loaded_models,
-            image_paths,
-            valid_label_paths,
-            label=trial_label,
-            start_time=sim_start_time,
+        # Compute F1 score from CACHED results - no inference!
+        f1_neg, precision_score, recall_score, f1_score = compute_f1_from_cache(
+            cached_fused_results,
+            valid_label_paths
         )
-
-        # Update summary line after trial completes
-        tracker.update(trial.number + 1, args.trials, precision_score, recall_score, f1_score)
 
         # Store precision/recall so resume can seed the tracker correctly
         trial.set_user_attr("precision", precision_score)
         trial.set_user_attr("recall", recall_score)
 
-        # Return negative F1 for minimization
         return f1_neg
     
     # Run optimization
@@ -527,7 +592,8 @@ def main():
     
     # Reconstruct MODEL_WEIGHTS from flat params
     model_weights = {}
-    for model_name in MODEL_NAMES:
+    loaded_model_names = [model_name for model_name, _, _ in loaded_models]
+    for model_name in loaded_model_names:
         model_weights[model_name] = {}
         for class_name in CLASS_NAMES:
             model_weights[model_name][class_name] = best_params_dict.get(f"w_{model_name}_{class_name}", 1.0)
@@ -550,7 +616,7 @@ def main():
     print(f"    SCORE_MARGIN_THRESH         : {best_params['SCORE_MARGIN_THRESH']:.4f}")
     print(f"    DISAGREEMENT_RATIO_THRESH   : {best_params['DISAGREEMENT_RATIO_THRESH']:.4f}")
     print("\n  Per-model per-class weights:")
-    for model_name in MODEL_NAMES:
+    for model_name in best_params["MODEL_WEIGHTS"]:
         print(f"    {model_name}:")
         for class_name in CLASS_NAMES:
             w = best_params["MODEL_WEIGHTS"][model_name][class_name]

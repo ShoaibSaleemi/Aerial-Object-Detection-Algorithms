@@ -45,10 +45,10 @@ ENABLED_MODELS = {
     "yolo8m": True,
     "yolo9t": False,
     "yolo10n": False,
-    "yolo11n": False,
+    "yolo11n": True,
     "yolo12n": False,
     "yolo26n": True,
-    "fasterrcnn": True,
+    "fasterrcnn": False,
 }
 
 FUSION_IOU_THRESH = 0.50
@@ -56,7 +56,7 @@ IMGSZ = 640
 DEVICE = ""  # "cpu", "0", "0,1"; empty lets Ultralytics auto-select.
 
 # Unknown-decision thresholds and model weights — loaded from tuner output if available.
-_BEST_PARAMS_JSON = PROJECT_ROOT / "runs" / "detect" / "tune_wbf_6" / "best_params_bayesian_6.json"
+_BEST_PARAMS_JSON = PROJECT_ROOT / "runs" / "detect" / "tune_wbf_3" / "best_params_bayesian_3.json"
 _defaults = {
     "MIN_MODEL_SUPPORT": 5,
     "KNOWN_FUSED_CONF_THRESH": 0.68770202403814,
@@ -460,8 +460,13 @@ def build_confusion_matrix(fused_results, label_paths, images_dir, iou_thresh, v
 
 
 def plot_confusion(matrix, save_path, title_prefix):
+    # Normalize by column (ground truth totals) and convert to percentages
+    col_sums = matrix.sum(axis=0, keepdims=True).astype(float)
+    col_sums[col_sums == 0] = 1  # Avoid division by zero
+    display_matrix = matrix.astype(float) / col_sums * 100.0
+    
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.imshow(matrix, cmap="Blues")
+    ax.imshow(display_matrix, cmap="Blues")
 
     ax.set_xticks(np.arange(len(CLASS_NAMES)))
     ax.set_yticks(np.arange(len(CLASS_NAMES)))
@@ -472,9 +477,9 @@ def plot_confusion(matrix, save_path, title_prefix):
 
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
-            text_color = "white" if i == 2 and j == 2 else "black"
+            text_color = "white" if i == j else "black"
             ax.text(
-                j, i, matrix[i, j],
+                j, i, f"{display_matrix[i, j]:.1f}",
                 ha="center", va="center",
                 color=text_color, fontsize=CELL_VALUE_FONTSIZE,
             )
@@ -593,18 +598,24 @@ def print_confusion_and_metrics_side_by_side(matrix, per_class_metrics, macro_me
 def save_metrics_table_csv(per_class_metrics, macro_metrics, save_path):
     rows = []
     for m in per_class_metrics:
+        prec_val = f"{m['Precision'] * 100:.2f}".replace(".", ",") if not np.isnan(m["Precision"]) else "nan"
+        rec_val = f"{m['Recall'] * 100:.2f}".replace(".", ",") if not np.isnan(m["Recall"]) else "nan"
+        f1_val = f"{m['F1-score'] * 100:.2f}".replace(".", ",") if not np.isnan(m["F1-score"]) else "nan"
         rows.append([
             m["class"],
-            fmt_pct(m["Precision"]),
-            fmt_pct(m["Recall"]),
-            fmt_pct(m["F1-score"]),
+            prec_val,
+            rec_val,
+            f1_val,
         ])
 
+    macro_prec = f"{macro_metrics['Precision'] * 100:.2f}".replace(".", ",") if not np.isnan(macro_metrics["Precision"]) else "nan"
+    macro_rec = f"{macro_metrics['Recall'] * 100:.2f}".replace(".", ",") if not np.isnan(macro_metrics["Recall"]) else "nan"
+    macro_f1 = f"{macro_metrics['F1-score'] * 100:.2f}".replace(".", ",") if not np.isnan(macro_metrics["F1-score"]) else "nan"
     rows.append([
         "macro-avg",
-        fmt_pct(macro_metrics["Precision"]),
-        fmt_pct(macro_metrics["Recall"]),
-        fmt_pct(macro_metrics["F1-score"]),
+        macro_prec,
+        macro_rec,
+        macro_f1,
     ])
 
     save_path = Path(save_path)

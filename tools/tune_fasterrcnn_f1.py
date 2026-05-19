@@ -30,7 +30,7 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
 LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
-DEFAULT_CHECKPOINT = PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "fasterrcnn_epoch_50.pt"
+DEFAULT_CHECKPOINT = PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "best.pt"
 OUTPUT_DIR = PROJECT_ROOT / "runs" / "fasterrcnn" / "tune_f1"
 
 CLASS_NAMES = ["bird", "drone", "unknown"]

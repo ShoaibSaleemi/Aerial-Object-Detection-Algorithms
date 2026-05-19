@@ -35,6 +35,20 @@ from ultralytics import YOLO
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# ── Model selection ───────────────────────────────────────────────────────────
+# Set exactly one model to True to skip the interactive prompt.
+# If all are False, the script will ask at runtime.
+ENABLED_MODELS = {
+    "yolo8n":     False,
+    "yolo8m":     False,
+    "yolo9t":     False,
+    "yolo10n":    False,
+    "yolo11n":    False,
+    "yolo12n":    False,
+    "yolo26n":    False,
+    "fasterrcnn": False,
+}
+
 VIDEO_ROOT  = PROJECT_ROOT / "dataset" / "test" / "videos"
 CONF_THRESH = 0.7
 IMG_SIZE    = 640
@@ -51,6 +65,20 @@ def choose_run_folder() -> str:
 
     if len(available_runs) == 0:
         raise ValueError(f"No folders found in {detect_root_dir}")
+
+    # Priority: ENABLED_MODELS constant → command-line arg → interactive prompt
+    enabled = [name for name, on in ENABLED_MODELS.items() if on]
+    if len(enabled) > 1:
+        raise ValueError(f"Only one model may be enabled at a time, got: {enabled}")
+    if len(enabled) == 1:
+        run_name = enabled[0]
+        if run_name not in available_runs:
+            available_text = ", ".join(available_runs)
+            raise ValueError(
+                f"ENABLED_MODELS '{run_name}' not found in runs/detect. "
+                f"Available: {available_text}"
+            )
+        return run_name
 
     if len(sys.argv) > 1:
         run_name = sys.argv[1]
