@@ -166,6 +166,8 @@ Update `data.yaml` to point to your dataset root before training or evaluation.
 
 ### 1. Preprocess Dataset
 
+Before training or evaluation, remap label IDs to standardised format (bird=0, drone=1, unknown=2):
+
 ```bash
 # For YOLO training
 python scripts/dataset_preprocess/prepare_training_yolo.py
@@ -177,63 +179,110 @@ python scripts/dataset_preprocess/prepare_training_fasterrcnn.py
 python scripts/dataset_preprocess/prepare_validating_yolo_fasterrcnn.py
 ```
 
+**Configuration:** Update `data.yaml` to point to your dataset root before running any preprocessing or training scripts.
+
 ### 2. Train Models
 
-**YOLO (edit model path and hyperparameters inside the script):**
+**YOLO (nano, small, medium, etc.):**
 ```bash
+# Edit `training_yolo.py` to select model variant:
+#   MODEL = "yolov8n.pt"  # nano
+#   MODEL = "yolov8m.pt"  # medium
+#   MODEL = "yolov8s.pt"  # small
+#
+# Optionally adjust hyperparameters: epochs, batch_size, learning_rate, device
 python scripts/model_training/training_yolo.py
 ```
 
-**Faster R-CNN (edit `CONFIG` dict inside the script):**
+**Faster R-CNN:**
 ```bash
+# Edit `CONFIG` dict inside training_fasterrcnn.py for:
+#   - batch_size
+#   - num_epochs
+#   - learning_rate
+#   - device (cuda/cpu)
 python scripts/model_training/training_fasterrcnn.py
 ```
+
+Training output (model weights, logs) is saved to `runs/detect/` and `runs/fasterrcnn/`.
 
 ### 3. Evaluate Models
 
 ```bash
-# Individual YOLO model evaluation
+# Individual YOLO model evaluation (generates confusion matrices, metrics)
 python scripts/model_evaluation/eval_yolo.py
 
 # Faster R-CNN evaluation
 python scripts/model_evaluation/eval_fasterrcnn.py
 
-# WBF ensemble evaluation
+# WBF ensemble evaluation (fuses detections from multiple models)
 python scripts/model_evaluation/eval_wbf.py
 
-# WC-NMS ensemble evaluation
+# WC-NMS ensemble evaluation (alternative fusion strategy)
 python scripts/model_evaluation/eval_wc-nms.py
 ```
 
-Results (confusion matrix PNGs, metrics CSVs) are saved under `runs/`.
+**Output:** Confusion matrix PNGs and metrics CSVs are saved under `runs/` directory.
 
-### 4. Tune Hyperparameters
+### 4. Tune Hyperparameters (Bayesian Optimisation)
 
 ```bash
-# Tune WBF parameters (6-model ensemble, Bayesian optimisation)
+# Tune WBF per-class weights (6-model ensemble, ~100 trials)
 python tools/tune_wbf_6.py --trials 100 --seed 42
 
-# Tune WBF parameters (3-model ensemble)
+# Tune WBF per-class weights (3-model ensemble, ~50 trials)
 python tools/tune_wbf_3.py --trials 50 --seed 42
 
-# Tune per-model YOLO confidence thresholds
+# Tune per-model YOLO confidence thresholds (for F1-score maximisation)
 python tools/tune_yolo_f1.py
 
 # Tune Faster R-CNN confidence threshold
 python tools/tune_fasterrcnn_f1.py
+
+# Tune WBF + Kalman/LSTM tracking parameters
+python tools/tune_wbf_tracking.py --trials 100
 ```
+
+**Storage:** Optuna databases are saved as SQLite files in the project root or `runs/` directory (see `/memories/repo/optuna_storage_paths.md` for details).
 
 ### 5. Video Inference
 
 ```bash
-# WBF ensemble + Kalman/LSTM tracking
+# WBF ensemble + Kalman filter + LSTM smoothing (standard inference)
 python scripts/inference_video/inference_video_wbf_tracking.py
 
 # WBF + tracking + STL/RTM physical requirement overrides
 python scripts/inference_video/inference_video_wbf_tracking_stl.py
 ```
 
-The scripts prompt for a video file via an interactive selector. Output is saved to `runs/detect/inference_video/`.
+**Interaction:** Scripts prompt for a video file via an interactive file selector. Output (annotated video + JSON detections) is saved to `runs/detect/inference_video/`.
+
+---
+
+## Common Tasks & Utilities
+
+| Task | Script | Notes |
+|------|--------|-------|
+| Check train/test overlap | `tools/check_dataset_overlap.py` | Detects duplicate images across splits |
+| Split dataset by class | `tools/split_by_class.py` | Organise images by bird/drone/unknown |
+| Label statistics | `tools/labels_*.py` | Generate class distribution reports |
+| Delete empty labels | `tools/gui_delete_empty.py` | Interactive GUI for label cleanup |
+| Remap label IDs | `tools/gui_remap.py` | Interactive GUI for ID remapping |
+| Plot PR curves | `tools/plot_pr_curves.py` | Visualise precision-recall trade-offs |
+| Plot F1 curves | `tools/plot_yolo_f1_curve.py` | Visualise F1 vs. confidence threshold |
+| Evaluate mAP@50 | `tools/eval_yolo_map50.py` | Compute mean average precision |
+
+---
+
+## Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| CUDA out of memory during training | Reduce `batch_size` in training scripts |
+| Models not found during inference | Ensure model weights are in `runs/detect/` or specify full path |
+| Label format errors | Run `prepare_training_yolo.py` or `prepare_training_fasterrcnn.py` to remap IDs |
+| Optuna resuming fails | Check `/memories/repo/optuna_resume_notes.md` for storage and session recovery |
+| Tracking inaccurate | Tune Kalman/LSTM parameters with `tools/tune_wbf_tracking.py` |
 
 ---
 
