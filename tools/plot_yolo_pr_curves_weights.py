@@ -54,6 +54,7 @@ MODEL_ORDER = ["yolo8n", "yolo8m", "yolo9t", "yolo10n", "yolo11n", "yolo12n", "y
 
 PLOT_FIGSIZE          = (7, 6)
 PLOT_LINEWIDTH        = 2.5
+PLOT_ALPHA            = 1.0
 PLOT_COLORMAP         = "plasma"
 PLOT_SMOOTH_SIGMA     = 9.0       # Gaussian smoothing sigma (0 = off)
 
@@ -62,6 +63,7 @@ PLOT_YLIM             = (0.0, 1.05)
 
 PLOT_XLABEL_FONTSIZE  = 20
 PLOT_YLABEL_FONTSIZE  = 20
+PLOT_TITLE_FONTSIZE   = 20
 PLOT_TICK_FONTSIZE    = 20
 PLOT_LEGEND_FONTSIZE  = 20
 
@@ -176,7 +178,7 @@ def plot_and_save(
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
     norm = Normalize(vmin=float(conf_values.min()), vmax=float(conf_values.max()))
     lc = LineCollection(segments, cmap=PLOT_COLORMAP, norm=norm,
-                        linewidth=PLOT_LINEWIDTH, alpha=1.0, zorder=3)
+                        linewidth=PLOT_LINEWIDTH, alpha=PLOT_ALPHA, zorder=3)
     lc.set_array((conf_values[:-1] + conf_values[1:]) / 2.0)
     ax.add_collection(lc)
 
