@@ -1,8 +1,8 @@
 """
-Compute mAP@0.5 for individual YOLO model checkpoints.
+Compute mAP@0.5 for individual YOLO model checkpoints on test dataset.
 
 For each discovered YOLO model checkpoint in the target set, this script runs
-inference at conf=0.001 on the validation images, then computes per-class
+inference at conf=0.001 on the test images, then computes per-class
 Average Precision at IoU 0.5 using 101-point COCO-style interpolation.
 
   mAP@0.5 = mean of per-class APs (classes: bird, drone, unknown)
@@ -28,11 +28,12 @@ from PIL import Image
 from ultralytics import YOLO
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
-LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
+IMAGES_DIR = PROJECT_ROOT / "dataset" / "test" / "images"
+LABELS_DIR = PROJECT_ROOT / "dataset" / "test" / "labels"
 RUNS_DIR = PROJECT_ROOT / "runs" / "detect"
 OUTPUT_DIR = RUNS_DIR / "yolo_map"
-AGGREGATE_JSON = OUTPUT_DIR / "best_yolo_map50.json"
+AGGREGATE_JSON = OUTPUT_DIR / "best_yolo_map50_test.json"
+DATASET_SPLIT = IMAGES_DIR.parent.name  # "test" or "validation"
 
 CLASS_NAMES = ["bird", "drone", "unknown"]
 N_CLASSES = len(CLASS_NAMES)
@@ -152,14 +153,22 @@ def find_validation_pairs(images_dir: Path, labels_dir: Path) -> tuple[list[Path
 
 
 def discover_models(runs_dir: Path) -> list[tuple[str, Path]]:
-    flat_weights_dir = runs_dir / "weights"
-    if not flat_weights_dir.is_dir():
-        raise FileNotFoundError(f"Weights directory not found: {flat_weights_dir}")
-    models = [(pt_path.stem, pt_path) for pt_path in sorted(flat_weights_dir.glob("*.pt"))]
+    """Discover model checkpoints from runs/detect/<run_name>/weights/best.pt structure."""
+    if not runs_dir.is_dir():
+        raise FileNotFoundError(f"Runs directory not found: {runs_dir}")
+    
+    models = []
+    for run_dir in sorted(runs_dir.iterdir()):
+        if not run_dir.is_dir():
+            continue
+        best_pt = run_dir / "weights" / "best.pt"
+        if best_pt.exists():
+            models.append((run_dir.name, best_pt))
+    
     if not models:
         raise FileNotFoundError(
-            f"No model checkpoints found in {flat_weights_dir}. "
-            "Ensure runs/detect/weights/<model>.pt exists."
+            f"No model checkpoints found in {runs_dir}. "
+            "Ensure runs/detect/<run_name>/weights/best.pt exists."
         )
     return models
 
@@ -191,17 +200,18 @@ def load_or_build_cache(
     image_paths: list[Path],
     valid_label_paths: list[Path],
     start_time: float,
+    dataset_split: str = "test",
 ) -> list[dict]:
     """
     Load cached predictions from disk (shared with tune_yolo_f1.py), or run
     inference and save them.
 
-    Cache file: <model_path.parent>/pred_cache_<model_name>_imgsz<IMGSZ>.json
+    Cache file: <model_path.parent>/pred_cache_<model_name>_<split>_imgsz<IMGSZ>.json
     Format (same as tune_yolo_f1.py): list of per-image dicts:
         [{"gt_boxes": [[x1,y1,x2,y2],...], "gt_labels": [int,...],
           "preds": [[conf, cls_id, [x1,y1,x2,y2]], ...]}, ...]
     """
-    cache_filename = f"pred_cache_{model_name}_imgsz{IMGSZ}.json"
+    cache_filename = f"pred_cache_{model_name}_{dataset_split}_imgsz{IMGSZ}.json"
     cache_path = model_path.parent / cache_filename
     total_files = len(image_paths)
 
@@ -399,6 +409,7 @@ def evaluate_single_model(
         image_paths=image_paths,
         valid_label_paths=valid_label_paths,
         start_time=start_time,
+        dataset_split=DATASET_SPLIT,
     )
 
     map50, map50_95, per_class_results = compute_map_metrics(
@@ -459,7 +470,7 @@ def main() -> None:
         raise FileNotFoundError(f"Runs dir not found: {RUNS_DIR}")
 
     print("=" * 70)
-    print("  YOLO mAP@0.5 Evaluator (3-class)")
+    print("  YOLO mAP@0.5 Evaluator (3-class) - Test Set")
     print("=" * 70)
     print(f"  Images dir     : {IMAGES_DIR}")
     print(f"  Labels dir     : {LABELS_DIR}")
@@ -481,8 +492,8 @@ def main() -> None:
 
     if not discovered_models:
         raise RuntimeError(
-            f"No matching checkpoints found in {RUNS_DIR / 'weights'}. "
-            "Ensure runs/detect/weights/<model>.pt exists."
+            f"No matching checkpoints found in {RUNS_DIR}. "
+            "Ensure runs/detect/<run_name>/weights/best.pt exists."
         )
 
     print(f"  {len(discovered_models)} model(s) to evaluate:")
@@ -524,6 +535,19 @@ def main() -> None:
         json.dump(aggregate, f, indent=2)
 
     print(f"\nAggregate results saved: {AGGREGATE_JSON}")
+
+    # Save CSV with European decimal format (. -> ,)
+    import csv
+    csv_path = OUTPUT_DIR / "best_yolo_map50_test.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["Model", "mAP@0.5", "mAP@0.5-0.95"])
+        for model_name in sorted(all_results.keys()):
+            res = all_results[model_name]
+            map50_str = f"{res['map_50']:.6f}".replace(".", ",")
+            map50_95_str = f"{res['map_50_95']:.6f}".replace(".", ",")
+            writer.writerow([model_name, map50_str, map50_95_str])
+    print(f"CSV results saved: {csv_path}")
 
     ranking = sorted(all_results.items(), key=lambda kv: kv[1]["map_50"], reverse=True)
 

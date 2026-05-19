@@ -1,8 +1,7 @@
-"""
-Compute mAP@0.5 for Faster R-CNN checkpoints.
+"""Compute mAP@0.5 for Faster R-CNN checkpoints on test dataset.
 
 For each discovered checkpoint in runs/fasterrcnn/train, this script runs
-inference at conf=0.001 on the validation images, then computes per-class
+inference at conf=0.001 on the test images, then computes per-class
 Average Precision at IoU 0.5 using 101-point COCO-style interpolation.
 
   mAP@0.5 = mean of per-class APs (classes: bird, drone, unknown)
@@ -31,11 +30,11 @@ from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-IMAGES_DIR = PROJECT_ROOT / "dataset" / "validation" / "images"
-LABELS_DIR = PROJECT_ROOT / "dataset" / "validation" / "labels"
+IMAGES_DIR = PROJECT_ROOT / "dataset" / "test" / "images"
+LABELS_DIR = PROJECT_ROOT / "dataset" / "test" / "labels"
 CHECKPOINT_DIR = PROJECT_ROOT / "runs" / "fasterrcnn" / "train"
 OUTPUT_DIR = PROJECT_ROOT / "runs" / "fasterrcnn" / "map50"
-AGGREGATE_JSON = OUTPUT_DIR / "best_fasterrcnn_map50.json"
+AGGREGATE_JSON = OUTPUT_DIR / "best_fasterrcnn_map50_test.json"
 
 CLASS_NAMES = ["bird", "drone", "unknown"]
 N_CLASSES = len(CLASS_NAMES)
@@ -43,6 +42,8 @@ N_CLASSES = len(CLASS_NAMES)
 # Very low confidence to collect full PR curves.
 CONF_INFER = 0.001
 IOU_THRESH = 0.5
+
+IOU_THRESHOLDS_95 = np.linspace(0.5, 0.95, 10)  # [0.50, 0.55, ..., 0.95]
 
 IMAGE_EXTENSIONS = [".jpg", ".png", ".jpeg", ".bmp", ".tif", ".tiff"]
 
@@ -191,10 +192,12 @@ def compute_map50(
     valid_label_paths: list[Path],
     device: str,
     start_time: float,
-) -> tuple[float, list[dict]]:
+) -> tuple[float, float, list[dict]]:
     total_files = len(image_paths)
 
-    per_class_preds: list[list[tuple[float, int]]] = [[] for _ in range(N_CLASSES)]
+    per_class_preds_all_ious: list[list[list[tuple[float, int]]]] = [
+        [[] for _ in range(len(IOU_THRESHOLDS_95))] for _ in range(N_CLASSES)
+    ]
     per_class_n_gt = [0] * N_CLASSES
 
     for idx, (image_path, label_path) in enumerate(zip(image_paths, valid_label_paths), 1):
@@ -235,23 +238,25 @@ def compute_map50(
                 reverse=True,
             )
 
-            matched_gt = set()
-            for conf_val, pb in c_pred_items:
-                best_iou = 0.0
-                best_gt_idx = -1
-                for gi, gb in enumerate(c_gt_boxes):
-                    if gi in matched_gt:
-                        continue
-                    iou = compute_iou(pb, gb)
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_gt_idx = gi
+            # For each IoU threshold, compute TP/FP
+            for iou_idx, iou_t in enumerate(IOU_THRESHOLDS_95):
+                matched_gt = set()
+                for conf_val, pb in c_pred_items:
+                    best_iou = 0.0
+                    best_gt_idx = -1
+                    for gi, gb in enumerate(c_gt_boxes):
+                        if gi in matched_gt:
+                            continue
+                        iou = compute_iou(pb, gb)
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_gt_idx = gi
 
-                if best_iou >= IOU_THRESH and best_gt_idx >= 0:
-                    matched_gt.add(best_gt_idx)
-                    per_class_preds[c].append((conf_val, 1))
-                else:
-                    per_class_preds[c].append((conf_val, 0))
+                    if best_iou >= iou_t and best_gt_idx >= 0:
+                        matched_gt.add(best_gt_idx)
+                        per_class_preds_all_ious[c][iou_idx].append((conf_val, 1))
+                    else:
+                        per_class_preds_all_ious[c][iou_idx].append((conf_val, 0))
 
         pct = idx / total_files * 100.0
         elapsed = time.time() - start_time
@@ -264,36 +269,67 @@ def compute_map50(
     _finish_inline_status_line()
 
     per_class_results = []
-    aps = []
+    aps50 = []
+    aps50_95 = []
 
     for c in range(N_CLASSES):
         n_gt = per_class_n_gt[c]
-        preds = per_class_preds[c]
 
         if n_gt == 0:
-            per_class_results.append({"class": CLASS_NAMES[c], "n_gt": 0, "ap": None})
+            per_class_results.append({
+                "class": CLASS_NAMES[c],
+                "n_gt": 0,
+                "ap50": None,
+                "ap50_95": None,
+            })
             continue
 
-        if not preds:
-            per_class_results.append({"class": CLASS_NAMES[c], "n_gt": n_gt, "ap": 0.0})
-            aps.append(0.0)
-            continue
+        # Compute AP@0.5 (first IoU threshold)
+        preds_50 = per_class_preds_all_ious[c][0]
+        if not preds_50:
+            ap50 = 0.0
+            aps50.append(0.0)
+        else:
+            preds_50.sort(key=lambda x: x[0], reverse=True)
+            tp_arr = np.array([p[1] for p in preds_50], dtype=np.float64)
+            fp_arr = 1.0 - tp_arr
+            cum_tp = np.cumsum(tp_arr)
+            cum_fp = np.cumsum(fp_arr)
+            recalls = cum_tp / n_gt
+            precisions = cum_tp / (cum_tp + cum_fp)
+            ap50 = compute_ap_101(recalls, precisions)
+            aps50.append(ap50)
 
-        preds.sort(key=lambda x: x[0], reverse=True)
-        tp_arr = np.array([p[1] for p in preds], dtype=np.float64)
-        fp_arr = 1.0 - tp_arr
-        cum_tp = np.cumsum(tp_arr)
-        cum_fp = np.cumsum(fp_arr)
+        # Compute AP at each IoU threshold for mAP@0.5-0.95
+        aps_all = []
+        for iou_idx in range(len(IOU_THRESHOLDS_95)):
+            preds_at_iou = per_class_preds_all_ious[c][iou_idx]
+            if not preds_at_iou:
+                aps_all.append(0.0)
+            else:
+                preds_at_iou.sort(key=lambda x: x[0], reverse=True)
+                tp_arr = np.array([p[1] for p in preds_at_iou], dtype=np.float64)
+                fp_arr = 1.0 - tp_arr
+                cum_tp = np.cumsum(tp_arr)
+                cum_fp = np.cumsum(fp_arr)
+                recalls = cum_tp / n_gt
+                precisions = cum_tp / (cum_tp + cum_fp)
+                ap = compute_ap_101(recalls, precisions)
+                aps_all.append(ap)
 
-        recalls = cum_tp / n_gt
-        precisions = cum_tp / (cum_tp + cum_fp)
+        ap50_95 = float(np.mean(aps_all)) if aps_all else 0.0
+        aps50_95.append(ap50_95)
 
-        ap = compute_ap_101(recalls, precisions)
-        aps.append(ap)
-        per_class_results.append({"class": CLASS_NAMES[c], "n_gt": n_gt, "ap": round(float(ap), 6)})
+        per_class_results.append({
+            "class": CLASS_NAMES[c],
+            "n_gt": n_gt,
+            "ap50": round(float(ap50), 6) if ap50 is not None else None,
+            "ap50_95": round(float(ap50_95), 6),
+        })
 
-    map50 = float(np.mean(aps)) if aps else 0.0
-    return map50, per_class_results
+    map50 = float(np.mean(aps50)) if aps50 else 0.0
+    map50_95 = float(np.mean(aps50_95)) if aps50_95 else 0.0
+    return map50, map50_95, per_class_results
 
 
 def evaluate_single_checkpoint(
@@ -315,7 +351,7 @@ def evaluate_single_checkpoint(
     model = build_model(checkpoint_path, device)
     start_time = time.time()
 
-    map50, per_class_results = compute_map50(
+    map50, map50_95, per_class_results = compute_map50(
         model=model,
         image_paths=image_paths,
         valid_label_paths=valid_label_paths,
@@ -331,6 +367,7 @@ def evaluate_single_checkpoint(
         "checkpoint": model_name,
         "checkpoint_path": str(checkpoint_path),
         "map_50": round(map50, 6),
+        "map_50_95": round(map50_95, 6),
         "per_class": per_class_results,
         "eval_time_seconds": round(elapsed, 1),
     }
@@ -340,11 +377,13 @@ def evaluate_single_checkpoint(
     with output_json.open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
 
-    print(f"  mAP@0.5 : {map50:.4f}")
+    print(f"  mAP@0.5     : {map50:.4f}")
+    print(f"  mAP@0.5-0.95: {map50_95:.4f}")
     for pc in per_class_results:
-        ap_str = f"{pc['ap']:.4f}" if pc["ap"] is not None else "N/A (no GT)"
-        print(f"    {pc['class']:10s}: AP={ap_str}  n_gt={pc['n_gt']}")
-    print(f"  Time    : {t_hour}:{t_min:02d}:{t_sec:02d}")
+        ap50_str = f"{pc['ap50']:.4f}" if pc["ap50"] is not None else "N/A"
+        ap95_str = f"{pc['ap50_95']:.4f}" if pc["ap50_95"] is not None else "N/A"
+        print(f"    {pc['class']:10s}: AP50={ap50_str}  AP50-95={ap95_str}  n_gt={pc['n_gt']}")
+    print(f"  Time        : {t_hour}:{t_min:02d}:{t_sec:02d}")
     print(f"  Saved   : {output_json}")
 
     return result
@@ -357,7 +396,7 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=str,
-        default="fasterrcnn_epoch_50",
+        default="best",
         help="Evaluate a single checkpoint stem (example: best or fasterrcnn_epoch_50). Omit to evaluate all *.pt files.",
     )
     parser.add_argument(
@@ -380,7 +419,7 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint dir not found: {CHECKPOINT_DIR}")
 
     print("=" * 70)
-    print("  Faster R-CNN mAP@0.5 Evaluator (3-class)")
+    print("  Faster R-CNN mAP@0.5 Evaluator (3-class) - Test Set")
     print("=" * 70)
     print(f"  Images dir     : {IMAGES_DIR}")
     print(f"  Labels dir     : {LABELS_DIR}")
@@ -389,7 +428,7 @@ def main() -> None:
     print(f"  IoU threshold  : {IOU_THRESH}")
     print(f"  Device         : {device}")
 
-    print("\nLoading validation images and labels...")
+    print("\nLoading test images and labels...")
     image_paths, valid_label_paths = find_validation_pairs(IMAGES_DIR, LABELS_DIR)
     print(f"  {len(image_paths)} image-label pairs loaded")
 
@@ -450,13 +489,28 @@ def main() -> None:
 
     print(f"\nAggregate results saved: {AGGREGATE_JSON}")
 
+    # Save CSV with European decimal format (. -> ,)
+    import csv
+    csv_path = OUTPUT_DIR / "best_fasterrcnn_map50_test.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["Checkpoint", "mAP@0.5", "mAP@0.5-0.95"])
+        for ckpt_name in sorted(all_results.keys()):
+            res = all_results[ckpt_name]
+            map50_str = f"{res['map_50']:.6f}".replace(".", ",")
+            map50_95_str = f"{res['map_50_95']:.6f}".replace(".", ",")
+            writer.writerow([ckpt_name, map50_str, map50_95_str])
+    print(f"CSV results saved: {csv_path}")
+
     ranking = sorted(all_results.items(), key=lambda kv: kv[1]["map_50"], reverse=True)
 
     print(f"\n{'=' * 70}")
     print("  mAP@0.5 Ranking")
     print(f"{'=' * 70}")
+    print(f"  {'Checkpoint':<20}  {'mAP@0.5':>10}  {'mAP@0.5-0.95':>14}")
+    print(f"  {'-'*20}  {'-'*10}  {'-'*14}")
     for rank, (name, res) in enumerate(ranking, 1):
-        print(f"  {rank}. {name:20s}  mAP@0.5 = {res['map_50']:.4f}")
+        print(f"  {rank}. {name:<18}  {res['map_50']:>10.4f}  {res['map_50_95']:>14.4f}")
     print(f"{'=' * 70}\n")
 
 

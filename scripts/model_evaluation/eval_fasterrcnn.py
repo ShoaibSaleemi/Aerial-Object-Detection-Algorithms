@@ -30,7 +30,7 @@ DATASET_SPLIT = "test" if USE_TEST_DATASET else "validation"
 
 # Edit these parameters directly before running this script.
 CONFIG = {
-    "model": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "fasterrcnn_epoch_50.pt"),
+    "model": str(PROJECT_ROOT / "runs" / "fasterrcnn" / "train" / "best.pt"),
     "images": str(PROJECT_ROOT / "dataset" / DATASET_SPLIT / "images"),
     "labels": str(PROJECT_ROOT / "dataset" / DATASET_SPLIT / "labels"),
     "iou_thresh": 0.5,
