@@ -100,7 +100,40 @@ All YOLO models are fine-tuned from pretrained weights. Faster R-CNN uses `Faste
 
 ---
 
-## Installation
+## Quick Start
+
+### Installation
+
+```bash
+# Clone the repository
+git clone <repo-url>
+cd thesis
+
+# Install dependencies (CUDA 12.6 build of PyTorch)
+pip install -r requirements.txt
+```
+
+> **Note:** The `requirements.txt` installs PyTorch with CUDA 12.6 support. Adjust the `--index-url` line for your CUDA version or for CPU-only use.
+
+### Minimal Example (GPU required)
+
+```bash
+# 1. Preprocess dataset
+python scripts/dataset_preprocess/prepare_training_yolo.py
+
+# 2. Train a single YOLO model (edit model choice inside script)
+python scripts/model_training/training_yolo.py
+
+# 3. Evaluate the trained model
+python scripts/model_evaluation/eval_yolo.py
+
+# 4. Run inference on a video with WBF ensemble
+python scripts/inference_video/inference_video_wbf_tracking.py
+```
+
+---
+
+## Installation (Detailed)
 
 ```bash
 # Clone the repository
