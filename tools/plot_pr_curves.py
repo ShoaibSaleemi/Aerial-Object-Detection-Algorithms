@@ -51,9 +51,9 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-TEST_IMAGES_DIR = PROJECT_ROOT / "dataset" / "test 2" / "images"
-TEST_LABELS_DIR = PROJECT_ROOT / "dataset" / "test 2" / "labels"
-TEST_TAG = TEST_IMAGES_DIR.parent.name.replace(" ", "")  # e.g. "test2"
+TEST_IMAGES_DIR = PROJECT_ROOT / "dataset 2" / "test" / "images"
+TEST_LABELS_DIR = PROJECT_ROOT / "dataset 2" / "test" / "labels"
+TEST_TAG = TEST_IMAGES_DIR.parents[1].name.replace(" ", "")  # e.g. "dataset2"
 DETECT_DIR = PROJECT_ROOT / "runs" / "detect"
 WEIGHTS_DIR = DETECT_DIR / "weights"
 FASTERRCNN_TRAIN_DIR = PROJECT_ROOT / "runs" / "fasterrcnn" / "train"
@@ -520,7 +520,7 @@ def plot_and_save(
             color="black",
             zorder=6,
             linestyle="None",
-            label=f"Best  (conf = {best_conf:.3f})",
+            label=f"Confidence threshold: {best_conf * 100:.2f}",
         )
         ax.legend(loc="lower left", fontsize=10, framealpha=0.85)
 

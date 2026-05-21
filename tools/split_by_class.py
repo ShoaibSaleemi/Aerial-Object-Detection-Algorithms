@@ -1,7 +1,7 @@
 ﻿"""
-Copies test images into subfolders by dominant class ID.
+Copies dataset split images into subfolders by dominant class ID.
 
-Output layout inside dataset/test/:
+Output layout inside dataset/{split}/:
     bird/      <- class 0 is most frequent in the label
     drone/     <- class 1 is most frequent
     unknown/   <- class 2 is most frequent
@@ -16,9 +16,17 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-IMAGES_DIR = PROJECT_ROOT / "dataset 2" / "test" / "images"
-LABELS_DIR = PROJECT_ROOT / "dataset 2" / "test" / "labels"
-OUTPUT_DIR  = PROJECT_ROOT / "dataset 2" / "test"
+# ── Split selection ────────────────────────────────────────────────────────
+RUN_TRAIN      = False
+RUN_VALIDATION = False
+RUN_TEST       = True
+# ───────────────────────────────────────────────────────────────────────────
+
+SPLITS = [
+    split for split, enabled in
+    [("train", RUN_TRAIN), ("validation", RUN_VALIDATION), ("test", RUN_TEST)]
+    if enabled
+]
 
 CLASS_NAMES = {0: "bird", 1: "drone", 2: "unknown"}
 
@@ -30,54 +38,60 @@ SPLIT_BY_CLASS = True
 PREFIX_LENGTH  = 7          # only used when SPLIT_BY_CLASS = False
 # ───────────────────────────────────────────────────────────────────────────
 
-if SPLIT_BY_CLASS:
-    for name in list(CLASS_NAMES.values()) + ["no_label"]:
-        (OUTPUT_DIR / name).mkdir(parents=True, exist_ok=True)
-
-print(f"IMAGES_DIR: {IMAGES_DIR}")
-print(f"LABELS_DIR: {LABELS_DIR}")
-
-image_files = sorted(f for f in IMAGES_DIR.iterdir() if f.is_file())
-total = len(image_files)
-start = time.time()
-counts = Counter()
-
-for idx, img_path in enumerate(image_files, start=1):
-    label_path = LABELS_DIR / (img_path.stem + ".txt")
+for split in SPLITS:
+    IMAGES_DIR = PROJECT_ROOT / "dataset 2" / split / "images"
+    LABELS_DIR = PROJECT_ROOT / "dataset 2" / split / "labels"
+    OUTPUT_DIR  = PROJECT_ROOT / "dataset 2" / split
 
     if SPLIT_BY_CLASS:
-        if not label_path.exists():
-            folder = OUTPUT_DIR / "no_label"
-            counts["no_label"] += 1
-        else:
-            class_counter = Counter()
-            with open(label_path, encoding="utf-8") as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 5:  # bbox (5) or polygon (7+)
-                        class_counter[int(parts[0])] += 1
+        for name in list(CLASS_NAMES.values()) + ["no_label"]:
+            (OUTPUT_DIR / name).mkdir(parents=True, exist_ok=True)
 
-            if not class_counter:
+    print(f"\n--- {split} ---")
+    print(f"IMAGES_DIR: {IMAGES_DIR}")
+    print(f"LABELS_DIR: {LABELS_DIR}")
+
+    image_files = sorted(f for f in IMAGES_DIR.iterdir() if f.is_file())
+    total = len(image_files)
+    start = time.time()
+    counts = Counter()
+
+    for idx, img_path in enumerate(image_files, start=1):
+        label_path = LABELS_DIR / (img_path.stem + ".txt")
+
+        if SPLIT_BY_CLASS:
+            if not label_path.exists():
                 folder = OUTPUT_DIR / "no_label"
                 counts["no_label"] += 1
             else:
-                dominant = class_counter.most_common(1)[0][0]
-                folder_name = CLASS_NAMES.get(dominant, f"class{dominant}")
-                folder = OUTPUT_DIR / folder_name
-                counts[folder_name] += 1
-    else:
-        folder_name = img_path.stem[:PREFIX_LENGTH]
-        folder = OUTPUT_DIR / folder_name
-        counts[folder_name] += 1
+                class_counter = Counter()
+                with open(label_path, encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 5:  # bbox (5) or polygon (7+)
+                            class_counter[int(parts[0])] += 1
 
-    folder.mkdir(exist_ok=True)
-    shutil.copy2(img_path, folder / img_path.name)
-    if idx % 50 == 0 or idx == total:
-        elapsed = time.time() - start
-        m, s = divmod(int(elapsed), 60)
-        print(f"Progress: {idx}/{total} ({idx/total*100:.1f}%)  Elapsed: {m}:{s:02d}", end="\r")
+                if not class_counter:
+                    folder = OUTPUT_DIR / "no_label"
+                    counts["no_label"] += 1
+                else:
+                    dominant = class_counter.most_common(1)[0][0]
+                    folder_name = CLASS_NAMES.get(dominant, f"class{dominant}")
+                    folder = OUTPUT_DIR / folder_name
+                    counts[folder_name] += 1
+        else:
+            folder_name = img_path.stem[:PREFIX_LENGTH]
+            folder = OUTPUT_DIR / folder_name
+            counts[folder_name] += 1
 
-print()
-print("Done.")
-for name, n in sorted(counts.items()):
-    print(f"  {name:>10}: {n} images")
+        folder.mkdir(exist_ok=True)
+        shutil.copy2(img_path, folder / img_path.name)
+        if idx % 50 == 0 or idx == total:
+            elapsed = time.time() - start
+            m, s = divmod(int(elapsed), 60)
+            print(f"Progress: {idx}/{total} ({idx/total*100:.1f}%)  Elapsed: {m}:{s:02d}", end="\r")
+
+    print()
+    print(f"Done ({split}).")
+    for name, n in sorted(counts.items()):
+        print(f"  {name:>10}: {n} images")

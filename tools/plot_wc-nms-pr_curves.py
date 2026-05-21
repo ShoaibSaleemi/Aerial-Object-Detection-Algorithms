@@ -84,12 +84,12 @@ MODEL_ORDER = ["yolo8n", "yolo8m", "yolo9t", "yolo10n", "yolo11n", "yolo12n", "y
 # Set RUN_ALL_MODELS = True to run every model regardless of ENABLED_MODELS.
 RUN_ALL_MODELS = False
 ENABLED_MODELS = {
-    "yolo8n":  False,
+    "yolo8n":  True,
     "yolo8m":  True,
-    "yolo9t":  False,
-    "yolo10n": False,
+    "yolo9t":  True,
+    "yolo10n": True,
     "yolo11n": True,
-    "yolo12n": False,
+    "yolo12n": True,
     "yolo26n": True,
 }
 
@@ -734,7 +734,7 @@ def plot_and_save(
             float(plot_R[idx]), float(plot_P[idx]),
             marker=PLOT_MARKER, markersize=PLOT_MARKER_SIZE, color=PLOT_MARKER_COLOR,
             zorder=6, linestyle="None",
-            label="Best",
+            label=f"Confidence threshold: {best_conf * 100:.2f}",
         )
         ax.legend(loc="lower left", fontsize=PLOT_LEGEND_FONTSIZE, framealpha=0.85)
 

@@ -46,12 +46,12 @@ MODEL_CONF_THRESH = {
 RUN_ALL_MODELS = True
 ENABLED_MODELS = {
     "yolo8n":  False,
-    "yolo8m":  False,
+    "yolo8m":  True,
     "yolo9t":  False,
     "yolo10n": False,
     "yolo11n": False,
     "yolo12n": False,
-    "yolo26n": False,
+    "yolo26n": True,
 }
 # -----------------------------------------------------------------------------
 

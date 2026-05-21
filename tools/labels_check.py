@@ -17,9 +17,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 ALL_SPLITS = {
-    "train":      PROJECT_ROOT / "dataset" / "train"      / "labels",
-    "validation": PROJECT_ROOT / "dataset" / "validation" / "labels",
-    "test":       PROJECT_ROOT / "dataset" / "test"   / "labels",
+    "train":      PROJECT_ROOT / "dataset 2" / "train"      / "labels",
+    "validation": PROJECT_ROOT / "dataset 2" / "validation" / "labels",
+    "test":       PROJECT_ROOT / "dataset 2" / "test"   / "labels",
 }
 
 # Set RUN_ALL_SPLITS = True to scan every split regardless of the flags below.
