@@ -519,7 +519,7 @@ def plot_and_save(
             float(plot_R[idx]), float(plot_P[idx]),
             marker=PLOT_MARKER, markersize=PLOT_MARKER_SIZE, color=PLOT_MARKER_COLOR,
             zorder=6, linestyle="None",
-            label="Best",
+            label=f"Confidence threshold: {best_conf * 100:.2f}",
         )
         ax.legend(loc="lower left", fontsize=PLOT_LEGEND_FONTSIZE, framealpha=0.85)
 
